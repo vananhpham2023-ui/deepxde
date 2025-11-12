@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: DeepXDE
-Version: 0.1.dev13+ge0f48532e.d20251110
+Version: 0.1.dev1+gb23f6df1c
 Summary: A library for scientific machine learning
 Author-email: Lu Lu <lululxvi@gmail.com>
 License: LGPL-2.1
@@ -179,3 +179,34 @@ DeepXDE is currently maintained by [Lu Lu](https://github.com/lululxvi) at [Yale
 ## License
 
 [LGPL-2.1 License](https://github.com/lululxvi/deepxde/blob/master/LICENSE)
+
+## Project Extension: estimation (Force Estimation PINN)
+
+This repository includes a project-specific package under `estimation/` for a
+physics‑informed neural network that estimates interaction forces in a
+quadrotor–payload system. It is built on top of DeepXDE and organized as a
+clean CLI pipeline for data → geometry → physics → training.
+
+- Entry: `estimation/cli.py` (script wrapper: `estimation/force_estimation.py`)
+- Dataset (default): `estimation/datasets/force_estimation_train.csv`
+- Monitoring: `metrics_logger.py` (CSV logging) and `gradient_monitor.py`
+- Residual scaling and weighting: `physics.py`, `weight_scheduler.py`
+
+Quick demo (PyTorch backend):
+```
+DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --demo --seed 42 --sample-size 64 --max-points 64 \
+  --adam-iters 5 --disable-lbfgs --num-domain 64 --skip-unit-check \
+  --metrics-csv logs/training_metrics.csv \
+  --residual-variance-path logs/residual_variance.csv \
+  --grad-monitor
+```
+
+Important CLI flags (Stage 3 features):
+- `--residual-norm-mode {off,median,mean}` and `--residual-scale-r{1,2,3}`
+- `--loss-weight-mode {manual,inverse_residual}`, `--loss-weight-r{1,2,3}`, `--bc-loss-weight`
+- `--adaptive-weights` with `--adaptive-weight-{period,alpha,min,max}`
+- `--metrics-csv` for stepwise CSV logging; `--grad-monitor` to log grad L2
+
+Backward compatibility: example shims under `examples/pinn_inverse/` re-export
+APIs from `estimation/` so existing example paths continue to run.

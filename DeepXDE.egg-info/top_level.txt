@@ -1,2 +1,5 @@
 checkpoints
 deepxde
+estimation
+geometry_comparison_runs
+tests
