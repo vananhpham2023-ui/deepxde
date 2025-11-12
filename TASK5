@@ -1,0 +1,1101 @@
+# 📘 Force Estimation PINN 模型改造与数值稳定性开发文档
+
+**版本**：v2.0（改造版）
+ **目标**：
+ 解决原版 `force_estimation.py` 中存在的训练不稳定问题（PDE 残差量级过大、BC 监督不下降），同时增强模型训练的可复现性、数值鲁棒性与调试可视化能力。
+
+------
+
+## 一、问题背景
+
+### 1. 原始问题
+
+在原版 `force_estimation.py` 的训练过程中观察到：
+
+- PDE 残差项（物理残差）在训练初期即飙升至 **1e26–1e27**；
+- BC（观测点监督）项仅处于 **1e3–1e5**，且几乎不下降；
+- 总 loss 被 PDE 分支“撑爆”，优化器梯度被完全淹没。
+
+### 2. 初步诊断
+
+导致失衡的主要原因有三类：
+
+| 问题类型                  | 典型表现                  | 原因                                                         |
+| ------------------------- | ------------------------- | ------------------------------------------------------------ |
+| **单位/量纲不一致**       | 残差项量级巨大、梯度爆炸  | 物理输入量如推力、质量、加速度单位不统一（如 g/cm/s² 混用）  |
+| **尺度失衡 & 权重不平衡** | r1/r2/r3 残差量级差异巨大 | 各分支物理意义不同（力 vs 力矩 vs 几何约束），但 LOSS_WEIGHTS 全为 1 |
+| **广播/反归一化问题**     | loss 无法下降             | 特征反归一化时使用的 min/max 来源不稳定或与采样数据错配      |
+
+------
+
+## 二、总体改造方案概述
+
+| 模块                                    | 改造要点                                                     | 预期收益                              |
+| --------------------------------------- | ------------------------------------------------------------ | ------------------------------------- |
+| **① 域内采样 + 混合几何方案**           | 用"低维几何 + 经验参数拼接"替代高维 Hypercube；只对动态变量（如时间、部分状态）建几何，其余参数从真实分布拼接 | 减少不合理样本组合、降低 PDE 残差方差 |
+| **② 随机子采样参数化 + 固定归一化统计** | 显式暴露 `--sample-size` 与 `--seed` 参数；在首次采样时缓存 min/max 并固定 | 提高可复现性与跨实验 loss 可比性      |
+| **③ 残差评估导出 + 可视化训练曲线**     | 每轮训练后输出残差均值/方差/MAE/RMSE；保存 ADAM 与 L-BFGS 的 loss 曲线 | 快速诊断训练状态、支持论文可视化      |
+| **④ 最小充要特征集精简**                | 将 37 维输入精简至 16-18 维，仅保留残差计算必需的物理量 | 降低输入维度、减少冗余、提升训练效率  |
+| **⑤ 常量/缓慢变量解耦**                 | 将轨迹常量（m_Q, m_L, g, l_length）移出网络输入，作为批次常量直接拼到残差计算 | 减少网络学习负担、提升数值稳定性      |
+| **⚙️ 附加：物理量纲归一 + 动态权重平衡** | 对 r1/r2/r3 各自归一化或引入自适应权重                       | 防止单分支残差主导、显著改善收敛性    |
+
+------
+
+## 三、详细实现方案
+
+### ① 启用域内采样与混合几何方案
+
+**原逻辑：**
+
+```python
+geom = dde.geometry.geometry_nd.Hypercube((xmin - dx), (xmax + dx))
+data = dde.data.PDE(geom, residual, bcs, num_domain=0, ...)
+```
+
+**改造：**
+
+1. 保留 Hypercube 仅用于 anchor 边界定义；
+2. 新增 `GeometryXTime` 或 `Interval` 几何，仅对可控自变量采样（如时间、推力变化）；
+3. 对静态参数（质量、重力、风速均值等）直接从数据行拼接；
+4. 域内采样（`num_domain > 0`）启用后，通过经验分布混采输入特征。
+
+**伪代码：**
+
+```python
+time_geom = dde.geometry.TimeDomain(0.0, 12.0)
+spatial_geom = dde.geometry.Rectangle([-1, -1], [1, 1])
+geom = dde.geometry.GeometryXTime(spatial_geom, time_geom)
+
+def mixed_sampling():
+    static_params = df_static.sample(n=num_domain, random_state=seed)
+    dynamic_points = geom.random_points(num_domain)
+    return np.concatenate([dynamic_points, static_params.to_numpy()], axis=1)
+```
+
+------
+
+### ② 随机子采样显式化 + 固定归一化统计
+
+**改造点：**
+
+- 新增 CLI 参数：
+
+  ```bash
+  --sample-size=10000
+  --seed=42
+  --norm-cache=normalizer_stats.pkl
+  ```
+
+- 修改 `load_dataset()`：
+
+  ```python
+  df = df.sample(n=args.sample_size, random_state=args.seed)
+  if os.path.exists(args.norm_cache):
+      stats = pickle.load(open(args.norm_cache, "rb"))
+      normalizer = Normalizer(stats["min"], stats["range"])
+  else:
+      normalizer = Normalizer.from_array(df[FEATURE_COLUMNS].to_numpy())
+      pickle.dump({"min": normalizer.minimum, "range": normalizer.range},
+                  open(args.norm_cache, "wb"))
+  ```
+
+- 确保训练、评估、推理使用**同一份统计量**。
+
+**收益：**
+
+- 归一化反变换（`inverse_tensor`）保持一致；
+- PDE 残差不再随采样抖动；
+- 训练结果可完全复现。
+
+------
+
+### ③ 残差评估导出与 `dde.saveplot()`
+
+**实现步骤：**
+
+1. **在训练阶段**捕获返回值：
+
+   ```python
+   losshistory, train_state = model.train(...)
+   dde.saveplot(losshistory, train_state, issave=True, isplot=False)
+   ```
+
+2. **在评估阶段**计算并导出物理残差：
+
+   ```python
+   metrics_df = compute_residual_metrics_numpy(df, preds)
+   metrics_df.to_csv("force_estimation_residual_metrics.csv", index=False)
+   ```
+
+3. **指标**包括：
+
+   - mean / std / MAE / RMSE
+   - 按 r1、r2、r3 各分量区分
+
+4. **论文图表建议：**
+
+   - 主表：Residual MAE / RMSE（7列分量）
+   - 附图：ADAM 与 L-BFGS 的 loss 曲线（`train_loss`, `test_loss`）
+
+------
+
+### ④ 最小充要特征集精简（37维 → 16-18维）
+
+**问题诊断：**
+
+原版代码使用 37 维输入特征，但实际物理残差 r₁/r₂/r₃ 仅依赖以下物理量：
+
+- **r₁（力平衡）需要**：`accQ(3)`, `accL(3)`, `m_Q(1)`, `m_L(1)`, `g(1)` → **9 维**
+- **r₂（力矩平衡）需要**：`rho(3)`, `f_Q(3, 预测输出)`, `thrust(1)`, `ez_world(3)`, `m_Q(1)`, `g(1)`, `accQ(3)` → **12 维**（去重后约 **11 维**）
+- **r₃（平行约束）需要**：`rho(3)`, `f_L(3, 预测输出)` → **3 维**
+
+**充要特征集（去重后）：**
+
+```python
+MINIMAL_FEATURE_COLUMNS = [
+    # 动态变量（12 维）
+    'accQ_x', 'accQ_y', 'accQ_z',      # 四旋翼加速度 (3)
+    'accL_x', 'accL_y', 'accL_z',      # 负载加速度 (3)
+    'rho_x', 'rho_y', 'rho_z',         # 连接向量 (3)
+    'ez_world_x', 'ez_world_y', 'ez_world_z',  # 世界坐标系 z 轴 (3)
+
+    # 动态控制量（必须进入网络输入）
+    'thrust',      # 推力 (1, 动态)
+    'm_Q',         # 四旋翼质量 (1)
+    'm_L',         # 负载质量 (1)
+    'g',           # 重力加速度 (1)
+    'l_length',    # 连接绳长度 (1, 可选)
+]
+```
+
+**实际维度：** 16-18 维（相比原 37 维减少 **50%+**）
+
+**改造步骤：**
+
+1. **重新定义特征列**：
+   ```python
+   # 替换原 FEATURE_COLUMNS
+   FEATURE_COLUMNS = MINIMAL_FEATURE_COLUMNS
+   ```
+
+2. **更新索引映射**（自动重新生成 `IDX_*`）：
+   ```python
+   # 动态生成索引（保持代码兼容性）
+   IDX_ACC_Q = [FEATURE_COLUMNS.index(f'accQ_{x}') for x in ['x','y','z']]
+   IDX_ACC_L = [FEATURE_COLUMNS.index(f'accL_{x}') for x in ['x','y','z']]
+   IDX_RHO = [FEATURE_COLUMNS.index(f'rho_{x}') for x in ['x','y','z']]
+   IDX_EZ_WORLD = [FEATURE_COLUMNS.index(f'ez_world_{x}') for x in ['x','y','z']]
+   IDX_THRUST = FEATURE_COLUMNS.index('thrust')
+   IDX_M_Q = FEATURE_COLUMNS.index('m_Q')
+   IDX_M_L = FEATURE_COLUMNS.index('m_L')
+   IDX_G = FEATURE_COLUMNS.index('g')
+   IDX_L_LENGTH = FEATURE_COLUMNS.index('l_length') if 'l_length' in FEATURE_COLUMNS else None
+   ```
+
+3. **保持残差函数不变**（物理公式依赖的量已全部包含）：
+   ```python
+   def build_force_estimation_residual(...):
+       # 原物理公式无需修改，索引自动适配
+       acc_Q = x_denorm[:, IDX_ACC_Q]
+       acc_L = x_denorm[:, IDX_ACC_L]
+       # ... 其他代码不变
+   ```
+
+**收益：**
+- **训练速度提升**：输入维度降低 50%，网络参数量减少
+- **数值稳定性增强**：冗余特征可能引入噪声和共线性
+- **更清晰的物理解释**：特征与物理方程一一对应
+
+------
+
+### ⑤ 常量/缓慢变量解耦（移出网络输入）
+
+**问题诊断：**
+
+以下变量在单次轨迹内为**常量或缓慢变化**，不应参与网络的高维非线性学习：
+
+- `m_Q`（四旋翼质量）：轨迹常量
+- `m_L`（负载质量）：轨迹常量
+- `g`（重力加速度）：物理常数 9.81 m/s²
+- `l_length`（绳长）：轨迹常量
+
+**问题影响：**
+1. 网络浪费容量学习"常量映射"（例如 `m_Q → m_Q`）
+2. 批次内不同轨迹的常量值混淆，网络难以区分
+3. 归一化/反归一化对常量处理不当可能引入数值误差
+
+**改造方案 A：批次常量拼接（推荐）**
+
+将常量从输入移除，在残差计算时直接作为批次张量拼接：
+
+#### 1. 网络输入包含动态变量 + 推力（13 维）
+NETWORK_INPUT_COLUMNS = [
+    'accQ_x', 'accQ_y', 'accQ_z',
+    'accL_x', 'accL_y', 'accL_z',
+    'rho_x', 'rho_y', 'rho_z',
+    'ez_world_x', 'ez_world_y', 'ez_world_z',
+    'thrust',
+]  # 总计: 13 维（推力为动态量）
+
+#### 2. 常量列单独处理
+CONSTANT_COLUMNS = ['m_Q', 'm_L', 'g', 'l_length']
+
+#### 3. 修改残差函数
+
+**理由：**
+1. 更符合物理直觉（常量不应参与网络学习；推力为动态控制量）
+2. 减少网络输入维度（13 维 vs 16-18 维）
+3. 避免归一化对常量的不当处理
+4. DeepXDE 的 `PDE` 类支持通过 `auxiliary_var` 或自定义采样传递批次常量
+
+**收益：**
+- **网络输入调整为 13 维（含 thrust）**（相比 37 维降低 **65%+**）
+- **数值稳定性显著提升**（常量不参与反向传播）
+- **训练效率提升**（更少的参数、更快的收敛）
+- **物理解释性更强**（网络专注学习动态映射）
+
+------
+
+## 四、数值稳定性修复与防爆策略
+
+### 1. 单位与量纲统一检查
+
+| 变量        | 期望单位 | 校验方式             |
+| ----------- | -------- | -------------------- |
+| (x_Q, x_L)  | m        | `max(abs(xQ)) < 10`  |
+| (v_Q, v_L)  | m/s      | `max(abs(vQ)) < 10`  |
+| (a_Q, a_L)  | m/s²     | `max(abs(aQ)) < 50`  |
+| 推力 thrust | N        | ≈ (m_Q g)            |
+| (m_Q, m_L)  | kg       | `mean ~ 1`           |
+| (g)         | m/s²     | 9.81                 |
+| (ρ, e_z)    | 单位向量 | `abs(norm-1) < 1e-3` |
+
+### 2. 残差归一化与动态权重调节
+
+| 残差项          | 归一基准                    | 建议处理         |
+| --------------- | --------------------------- | ---------------- |
+| (r_1)：力平衡   | ((m_Q+m_L)g)                | 除以中位数       |
+| (r_2)：力矩平衡 | (l_{\text{ref}} (m_Q+m_L)g) | 除以中位数       |
+| (r_3)：平行约束 | (\|\rho\|)                  | 若单位化则不处理 |
+
+> 若想动态调整：
+>  每 500 step 计算各分支 RMS，自动更新 `LOSS_WEIGHTS[i] = 1 / RMS_i`。
+
+### 3. 反归一化一致性与广播检查
+
+- 确保 `normalizer.inverse_tensor(x)` 的输出形状与特征完全对齐；
+
+- 若某列为常量（如 g），确保在反归一化时未被错误缩放；
+
+- 对异常值列进行分位截断：
+
+  ```python
+  df[col] = np.clip(df[col], df[col].quantile(0.01), df[col].quantile(0.99))
+  ```
+
+------
+
+## 五、验证与指标设计
+
+| 验证类型     | 指标                          | 期望表现                |
+| ------------ | ----------------------------- | ----------------------- |
+| 训练收敛     | total loss, PDE loss, BC loss | 收敛至 (10^0–10^2) 级别 |
+| 稳定性       | PDE 残差方差                  | 随 epoch 减小           |
+| 单位检查     | (\|\rho\|), (\|\text{ez}\|)   | ≈ 1                     |
+| 残差平衡     | (r_1:r_2:r_3) 比值            | 不超过 10³ 差距         |
+| 重复试验差异 | 不同 seed 结果                | <10% 差异               |
+
+------
+
+## 六、目录与文件组织建议
+
+```
+force_estimation/
+│
+├── datasets/
+│   └── force_estimation_train.csv
+│
+├── checkpoints/
+│   └── ...
+│
+├── normalizer_stats.pkl          # 固定的 min/max 缓存
+│
+├── logs/
+│   ├── train_plot_adam.png
+│   ├── train_plot_lbfgs.png
+│   └── force_estimation_residual_metrics.csv
+│
+└── force_estimation.py           # 改造版主程序
+```
+
+------
+
+## 七、预期改造效果
+
+| 指标              | 原版               | 改造后                    | 变化          |
+| ----------------- | ------------------ | ------------------------- | ------------- |
+| **输入特征维度**      | **37 维**              | **13-18 维（推荐 13 维）**    | **↓ 65%+**        |
+| **网络参数量**        | **基于 37 维**         | **基于 13 维（降低约 65%）**  | **↓ 65%+**        |
+| PDE 残差量级      | 1e26–1e27          | 1e0–1e2                   | ↓ 25 个数量级 |
+| 训练稳定性        | 不收敛 / loss 恒大 | 平稳收敛至常规区间        | ✅             |
+| 训练时间          | 长 / 梯度爆炸      | 收敛更快（少回溯 + 轻量化网络） | ↑30–50%       |
+| 重复实验一致性    | 极差               | 稳定可复现                | ✅             |
+| 可视化 & 论文支持 | 无图表输出         | 支持 MAE/RMSE 表 + 曲线图 | ✅             |
+| **物理可解释性**      | **冗余特征混淆**       | **特征与物理方程一一对应**    | **✅**            |
+
+------
+
+## 八、模型导出与 C++ 部署
+
+### 1. 模型导出需求
+
+**目标**：将训练好的 PINN 模型导出为 C++ 可加载的格式，用于替换 ROS MPC 控制器中的基于 L-BFGS 优化的力估计器。
+
+**输出文件**：
+1. **模型文件**：`force_estimator_model.pt` (TorchScript) 或 `force_estimator_model.onnx`
+2. **归一化参数**：`normalizer_params.json`（包含训练时的 min/max 统计量）
+3. **元数据**：`model_metadata.json`（记录输入/输出维度、网络结构等）
+
+### 2. 导出功能实现
+
+#### 2.1 修改 `force_estimation.py` 添加导出逻辑
+#### 2.2 在 `main()` 函数中调用导出
+
+### 3. C++ 推理集成方案
+
+#### 3.1 LibTorch 集成（推荐）
+
+**优点**：官方支持，性能最优，API 简单
+
+**安装**：
+```bash
+wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.1.0%2Bcpu.zip
+unzip libtorch-*.zip -d /opt/
+```
+
+#### 3.2 CMakeLists.txt 配置
+
+### 4. 验证与测试
+
+#### 4.1 Python 端导出验证
+
+#### 4.2 C++ 端推理一致性测试
+
+```
+
+### 5. 性能对比
+
+| 方法 | 推理延迟 | 内存占用 | 物理一致性 |
+|------|---------|---------|-----------|
+| L-BFGS 优化（原方法） | ~5-10 ms | 低 | 严格保证 |
+| 神经网络推理（新方法） | ~0.1-0.5 ms | 中（~10 MB） | 近似满足 |
+| 混合方法（NN初始化 + LBFGS微调） | ~1-2 ms | 中 | 严格保证 |
+
+**推荐策略**：
+- 如果对实时性要求极高（>500 Hz）：纯神经网络
+- 如果需要物理严格保证：混合方法
+- 如果计算资源充足：保持原 L-BFGS 方法
+
+------
+
+## 九、分阶段开发计划
+
+### 阶段一：基础设施重构与数据处理稳定化（1-2周）
+
+**目标**：建立稳定的数据加载、归一化和采样机制。阶段结束后，CLI、缓存、单位校验、分位数截断、最小特征集与常量管理需全部通过验证脚本，保证"同 seed 可复现，常量不进网络，数据质量可诊断"的上线标准。
+
+#### 开发任务
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| 1.1 | CLI 参数系统 | 添加 `--sample-size`、`--seed`、`--norm-cache` 参数 | 命令行可正确解析参数 |
+| 1.2 | 固定归一化统计 | 实现 `normalizer_stats.pkl` 缓存机制 | 多次运行使用相同统计量 |
+| 1.3 | 数据加载重构 | 修改 `load_dataset()` 支持随机采样与缓存加载 | 可复现相同的训练数据集 |
+| 1.4 | 单位与量纲检查 | 实现数据校验函数，检查所有物理量单位 | 能检测并报告单位异常 |
+| 1.5 | 异常值处理 | 添加分位数截断（0.01-0.99） | 数据分布更加稳定 |
+| **1.6** | **最小充要特征集精简** | **将 37 维输入精简至 16-18 维，重新定义 `FEATURE_COLUMNS`** | **特征集仅包含物理残差必需量** |
+| **1.7** | **常量管理模块实现** | **实现 `ConstantManager` 类，管理批次常量 (m_Q, m_L, g, l_length)** | **网络输入为 13 维（含 thrust），常量独立管理** |
+
+#### 追加：1.4.x 单位/量纲一致性增强（在 1.4 基础上落地修正逻辑）
+
+为解决实际 CSV 数据中出现的单位混用与方向向量未单位化问题，在阶段一追加以下子任务（不改变后续阶段边界）：
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| 1.4.1 | 单位转换器 UnitConverter | 在 `load_dataset()` 的“剪裁/归一化”之前新增“单位转换阶段”，将非 SI 列统一转换为 SI。支持两种用法：a) 自动阈值判定（如 |x|>1000 视为 cm→m）；b) CLI 显式指定单位。将转换信息写入 `dataset_cache` 元数据（`unit_profile`/`scales`）。 | 运行后 `run_unit_consistency_checks` 全 PASS（位置/速度/加速度阈值内）。 |
+| 1.4.2 | 向量单位化修正 | 对 `rho_*`、`ez_world_*` 执行强制单位化；若数据中提供 `xQ_*`、`xL_*`，允许配置为“由位置差自动重算 rho 再单位化”。提供开关 `--fix-unit-vectors`（默认开启）。 | `max |norm-1| <= 5e-3`，告警消失。 |
+| 1.4.3 | 推力物理化 | 若推力列不是牛顿，支持 `--thrust-unit N|gf` 自动换算（1 gf=0.00980665 N）；或通过 `--thrust-from <col>` + `--sqrt-kf-col sqrt_kf` 用物理公式派生牛顿推力。将推力来源/换算写入 `dataset_cache` 元数据。 | `max | thrust/((m_Q+m_L)g)-1 | <= 0.25`（默认阈值，可调）。 |
+
+建议新增 CLI（阶段一即可落地，默认不破坏现有流程）：
+- `--unit-profile si|cgs` 或细粒度：`--pos-unit m|cm --vel-unit mps|cmps --acc-unit mps2|cmps2`
+- `--fix-unit-vectors` / `--no-fix-unit-vectors`
+- `--thrust-unit N|gf`、`--thrust-from <col>`、`--sqrt-kf-col <col>`
+
+处理顺序（强制）：单位转换 → 向量单位化 → 分位数截断（1.5） → 归一化/缓存（1.2/1.3）。
+
+测试与验证：
+- 构造三组用例（cm 系列、gf 推力、未单位化向量），分别验证 1.4.1/1.4.2/1.4.3 后 `run_unit_consistency_checks` 全 PASS；
+- 变更任一单位参数应导致 `dataset_cache` 重建（元数据包含 `unit_profile`/`scales`/`thrust_source` 字段）。
+
+**任务 1.7 详细说明**：
+实现 `ConstantManager` 类作为**统一接口**，用于管理和提供批次常量：
+
+**与阶段二的关系**：
+- 阶段一实现 `ConstantManager` 类（基础设施）
+- 阶段二 Task 2.2 **复用**该类，通过 `auxiliary_var_function` 或自定义 PDE 类将常量传入残差计算
+- **关键设计原则**: 常量**不进入网络输入**，仅在 PDE 残差计算时使用
+- 阶段二专注于几何采样逻辑，常量管理已由阶段一完成
+
+**交付物**：
+- 更新的数据加载模块
+- 归一化缓存文件
+- 数据质量检查报告
+- **新的 `MINIMAL_FEATURE_COLUMNS` 定义**
+- **常量管理模块 (`ConstantManager` 类及使用文档)**
+- **单位转换与向量单位化实现（UnitConverter + normalize_vectors）及 CLI 文档**
+- **推力单位/派生转换实现与元数据记录（thrust_source/thrust_unit）**
+- **回归测试脚本：单位参数变更触发缓存重建，且单位校验全 PASS**
+- **CLI/日志验证脚本，覆盖 Task 1.1-1.7 的回归测试**
+
+**验证方法**：
+```bash
+# 测试1: 验证缓存生成与复用（不同 seed 使用相同统计量）
+python force_estimation.py --seed=42 --sample-size=10000
+# 应输出: "Saved normalizer stats to normalizer_stats.pkl"
+# 应生成: normalizer_stats.pkl 文件
+
+python force_estimation.py --seed=99 --sample-size=5000 --norm-cache=normalizer_stats.pkl
+# 应输出: "Loaded cached normalizer stats from normalizer_stats.pkl"
+# 验证: 检查日志中 normalizer min/max 与第一次运行一致
+
+# 测试2: 验证缓存缺失时的错误处理
+rm normalizer_stats.pkl
+python force_estimation.py --seed=42 --sample-size=10000 --norm-cache=missing_file.pkl
+# 应输出: Warning 或自动重新计算统计量
+
+# 测试3: 验证归一化统计一致性（不同 seed 使用相同缓存）
+python force_estimation.py --seed=42 --sample-size=10000  # 生成缓存
+python force_estimation.py --seed=99 --sample-size=5000 --norm-cache=normalizer_stats.pkl
+# 验证方法: 使用校验脚本比对归一化统计量
+python validate_normalizer.py --cache=normalizer_stats.pkl --run1-log=run_seed42.log --run2-log=run_seed99.log
+# 应输出:
+#   ✓ normalizer.minimum identical
+#   ✓ normalizer.range identical
+#   ✓ denormalized values in same physical range
+
+# 测试4: 验证完全可复现性（相同 seed + sample-size）
+python force_estimation.py --seed=42 --sample-size=10000 --output=run1_results.pkl
+python force_estimation.py --seed=42 --sample-size=10000 --norm-cache=normalizer_stats.pkl --output=run2_results.pkl
+# 验证方法: 比对训练数据和首次 loss
+python compare_runs.py --run1=run1_results.pkl --run2=run2_results.pkl
+# 应输出:
+#   ✓ Training data identical (hash match)
+#   ✓ Initial loss identical (diff < 1e-12)
+#   ✓ First 10 iterations loss curve identical
+```
+
+---
+
+### 阶段二：几何采样方案改造（1-2周）
+
+**目标**：实现低维几何 + 混合参数采样，降低 PDE 残差方差
+
+**核心KPI**: 混合几何残差方差降低
+- **最低门槛**: ≥30% (阶段晋级标准)
+- **理想目标**: ≥50% (验收优秀标准)
+
+#### 开发任务
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| 2.1 | 混合几何设计 | 设计 `GeometryXTime` 或低维几何方案（优先实现 TimeDomain + 静态拼接） | 能正确采样动态变量 |
+| 2.2 | 静态参数拼接 | **复用阶段一的 `ConstantManager`**，在 PDE 残差计算时传入常量（不进网络） | 样本分布符合真实数据，无重复实现 |
+| 2.3 | 域内采样启用 | 设置 `num_domain > 0`，启用 PDE 域内采样 | 域内点均匀分布 |
+| 2.4 | 采样可视化 | 绘制采样点分布（2D/3D 投影） | 验证无异常聚集 |
+| 2.5 | 残差方差计算工具 | 实现 `compute_residual_variance()` 函数，计算 r1/r2/r3 各分量方差 | 能输出各残差分量的方差统计 |
+| 2.6 | 对比实验 | 对比 Hypercube vs 混合几何的残差分布 | **理想目标**: 混合几何残差方差 < 原方案 50%；**最低要求**: < 原方案 30% |
+
+**Task 2.2 实现示例（正确做法：常量不进网络；推力为动态变量）**：
+
+```python
+# 方案A: 使用 DeepXDE 的 auxiliary_var 机制（推荐）
+from force_estimation_utils import ConstantManager
+
+# 1. 定义网络输入（13维: 12 动态 + thrust）
+NETWORK_INPUT_COLUMNS = [
+    'accQ_x', 'accQ_y', 'accQ_z',      # 四旋翼加速度 (3)
+    'accL_x', 'accL_y', 'accL_z',      # 负载加速度 (3)
+    'rho_x', 'rho_y', 'rho_z',         # 连接向量 (3)
+    'ez_world_x', 'ez_world_y', 'ez_world_z',  # 世界坐标系 z 轴 (3)
+    'thrust',                                    # 推力为动态控制量 (1)
+]  # 总计: 13 维
+
+# 2. 初始化常量管理器（不包含 thrust）
+const_mgr = ConstantManager(df, constant_columns=['m_Q', 'm_L', 'g'])
+
+# 3. 自定义采样函数（返回动态变量 + 常量，但分开存储）
+class MixedSampler:
+    def __init__(self, geom, const_mgr, df):
+        self.geom = geom
+        self.const_mgr = const_mgr
+        self.df = df
+
+    def sample_domain(self, num_points):
+        """采样域内点"""
+        # 几何采样动态变量（12维，不含 thrust）
+        dynamic_points_12 = self.geom.random_points(num_points)
+
+        # 从数据集中随机抽取 thrust（动态控制量，1维）
+        thrust_vals = (
+            self.df['thrust']
+            .sample(n=num_points, replace=True)
+            .to_numpy()
+            .reshape(-1, 1)
+        )
+
+        # 组合形成 13 维网络输入
+        dynamic_points = np.concatenate([dynamic_points_12, thrust_vals], axis=1)
+
+        # 随机选择对应的批次常量（3维或 4 维，取决于是否包含 l_length）
+        batch_indices = np.random.choice(len(self.df), num_points)
+        constants = self.const_mgr.get_batch_constants(batch_indices)
+
+        # 返回 (动态变量, 常量) 元组
+        return dynamic_points, constants
+
+# 4. 修改 PDE 残差函数，接收常量作为独立参数
+def build_force_estimation_residual_with_constants(normalizer):
+    """
+    构建支持外部常量的残差函数
+
+    关键改动: x 包含 13 维动态变量（含 thrust），constants 单独传入（不含 thrust）
+    """
+    def residual(x, y, aux_vars):
+        """
+        Args:
+            x: 网络输入（13维动态变量，含 thrust）
+            y: 网络输出（6维力估计）
+            aux_vars: 辅助变量（常量: m_Q, m_L, g[, l_length]）
+        """
+        # 反归一化动态变量（13维）
+        x_denorm = normalizer.inverse_tensor(x)
+
+        # 提取常量（不经过网络）
+        # 注意：thrust 为动态量，来自 x
+        m_Q = aux_vars[:, 0:1]
+        m_L = aux_vars[:, 1:2]
+        g = aux_vars[:, 2:3]
+
+        # 提取动态变量
+        acc_Q = x_denorm[:, 0:3]    # 形状: (batch, 3)
+        acc_L = x_denorm[:, 3:6]
+        rho = x_denorm[:, 6:9]
+        ez_world = x_denorm[:, 9:12]
+        thrust = x_denorm[:, 12:13]  # 动态推力（来自网络输入）
+
+        # 提取网络预测的力（6维）
+        f_Q = y[:, 0:3]
+        f_L = y[:, 3:6]
+
+        # 计算物理残差（使用常量）
+        # r1: 力平衡
+        r1 = f_Q + f_L - m_Q * acc_Q - m_L * acc_L - (m_Q + m_L) * g * ez_world
+
+        # r2: 力矩平衡（使用动态 thrust）
+        rho_cross_fQ = bkd.lib.cross(rho, f_Q)
+        thrust_term = thrust * ez_world  # 使用动态输入 thrust
+        r2 = rho_cross_fQ + m_Q * g * rho - m_Q * bkd.lib.cross(rho, acc_Q) - thrust_term
+
+        # r3: 平行约束
+        rho_norm = bkd.lib.norm(rho, axis=1, keepdims=True)
+        r3 = bkd.lib.sum(f_L * rho, axis=1, keepdims=True) / rho_norm
+
+        return bkd.lib.concatenate([r1, r2, r3], axis=1)
+
+    return residual
+
+# 5. 创建 DeepXDE 数据对象（使用 auxiliary_var_function）
+sampler = MixedSampler(time_geom, const_mgr, df)
+
+def auxiliary_var_function(x):
+    """
+    为每个输入点 x 提供对应的辅助变量（常量）
+    """
+    # 注意: 这里需要根据 x 的批次索引查找对应常量
+    # DeepXDE 会自动调用此函数
+    batch_size = x.shape[0]
+    # 简化版: 返回平均常量（实际应维护索引映射）
+    return np.tile(const_mgr.get_mean_constants(), (batch_size, 1))
+
+data = dde.data.PDE(
+    geom=time_geom,
+    pde=build_force_estimation_residual_with_constants(normalizer),
+    bcs=bcs,
+    num_domain=10000,
+    num_boundary=2000,
+    auxiliary_var_function=auxiliary_var_function  # 关键: 仅提供常量（不含 thrust）
+)
+
+# 6. 网络定义（输入13维，输出6维）
+net = dde.nn.FNN(
+    layer_sizes=[13, 64, 64, 64, 6],  # 输入13维（动态变量 + thrust；不包含常量）
+    activation="tanh",
+    kernel_initializer="Glorot uniform"
+)
+```
+
+**关键要点**：
+1. ✅ 网络输入为**13维**（12 个动态变量 + thrust）
+2. ✅ 常量通过 `auxiliary_var_function` 或自定义类传入
+3. ✅ 常量在残差函数中使用，但**不参与反向传播到网络权重**
+4. ✅ 实现了阶段一“网络输入维度调整为 13 维（含 thrust）”的目标
+```
+
+**交付物**：
+- `examples/pinn_inverse/force_estimation.py`：集成 `MixedFeatureSampler/MixedGeometry` 与 `ConstantManager`，完成混合几何采样（Task 2.1）与静态参数拼接（Task 2.2）
+- 自动域内采样推断：`--num-domain/--disable-auto-domain/--domain-*` CLI 组合实现 Task 2.3，默认输出 `num_domain=<auto>`
+- `--visualize-samples` 采样可视化（Task 2.4），PNG 存放于 `plots/sampling/`
+- 残差方差计算与导出（Task 2.5）：预测后自动生成 `logs/residual_variance.csv` 并打印 r1/r2/r3 方差摘要
+- `tests/test_force_estimation_sampling.py`：新增 8 项单元测试覆盖混合采样、常量拼接、域内推断、可视化与残差统计
+- 几何对比报告（Task 2.6）：`examples/pinn_inverse/geometry_comparison.py` 调用两次 `force_estimation.py`（带/不带 `--disable-mixed-geometry`）并生成 `geometry_comparison.csv`，默认比较基于 `logs/residual_variance.csv` 的方差指标。示例运行：  
+  ```bash
+  python3 examples/pinn_inverse/geometry_comparison.py \
+    --force-args "--demo --seed 42 --sample-size 64 --max-points 64 --adam-iters 5 --disable-lbfgs --num-domain 64 --skip-unit-check \
+    --norm-cache geometry_comparison_runs/norm.pkl --dataset-cache geometry_comparison_runs/dataset.pkl" \
+    --work-dir geometry_comparison_runs --output geometry_comparison.csv
+  ```
+
+---
+
+### 阶段三：残差归一化与权重平衡（2-3周）
+
+**目标**：实现物理残差归一化和动态权重调整，彻底解决量级失衡
+
+#### 开发任务
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| **3.0** | **监控基础设施** | **实现 `MetricsLogger` 类，实时记录残差/梯度/loss/权重** | **能在训练过程中持续输出并保存关键指标** |
+| 3.1 | 残差归一化实现 | 对 r1/r2/r3 分别除以特征尺度 | 各残差项在同一量级 |
+| 3.2 | 静态权重调优 | 手动调整 `LOSS_WEIGHTS` 找到最优配比 | PDE loss 与 BC loss 平衡 |
+| 3.3 | 动态权重调度器 | 实现每 N 步自动更新权重的 Callback（依赖 Task 3.0） | 权重随训练自适应调整 |
+| 3.4 | 梯度监控 | 添加梯度范数监控（依赖 Task 3.0 的日志系统），防止梯度爆炸/消失 | 梯度在合理范围 (1e-6 ~ 1e3) |
+| 3.5 | 稳定性测试 | 运行长时训练（10000+ iterations）验证稳定性 | 无 NaN/Inf，loss 平稳下降 |
+
+**任务依赖关系**：
+```
+Task 3.0 (监控基础设施)
+  ├─→ Task 3.3 (动态权重调度器需要实时残差 RMS 数据)
+  └─→ Task 3.4 (梯度监控需要日志记录能力)
+```
+
+**Task 3.0 详细说明**：
+实现 `MetricsLogger` 类，提供以下功能：
+- 实时计算并记录各残差分量的 mean/std/RMS
+- 记录梯度范数（每层或全局）
+- 记录当前权重配置
+- 支持导出为 CSV 或 TensorBoard 格式
+- 提供查询接口供动态权重调度器使用
+
+**备选方案**（若动态权重不稳定）：
+- 至少完成静态权重优化 (Task 3.2)
+- 保留残差归一化 (Task 3.1) + 手动调优权重作为基线方案
+
+**交付物**：
+- **监控基础设施** (`MetricsLogger` 类及配套工具)
+- 残差归一化函数
+- 动态权重调度器（`AdaptiveWeightScheduler`）
+- 梯度监控报告
+
+---
+
+### 阶段四：评估与可视化系统（1周）
+
+**目标**：建立完整的训练监控和残差评估体系
+
+#### 开发任务
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| 4.1 | 训练曲线保存 | 使用 `dde.saveplot()` 保存 loss history | 生成 PNG 格式训练曲线 |
+| 4.2 | 残差指标计算 | 实现 `compute_residual_metrics_numpy()` | 输出 mean/std/MAE/RMSE |
+| 4.3 | 指标导出 | 保存残差指标为 CSV 格式 | 可直接用于论文制表 |
+| 4.4 | 多阶段曲线对比 | 分别绘制 ADAM 与 L-BFGS 阶段的 loss | 清晰展示两阶段优化效果 |
+| 4.5 | 残差分布可视化 | 绘制 r1/r2/r3 的直方图和箱线图 | 可视化残差分布特性 |
+
+**交付物**：
+- `force_estimation_residual_metrics.csv`
+- `train_plot_adam.png`
+- `train_plot_lbfgs.png`
+- 残差分布图集
+
+**指标表格格式**：
+```
+| Metric | r1_x | r1_y | r1_z | r2_x | r2_y | r2_z | r3 |
+|--------|------|------|------|------|------|------|----|
+| MAE    | ...  | ...  | ...  | ...  | ...  | ...  |... |
+| RMSE   | ...  | ...  | ...  | ...  | ...  | ...  |... |
+| Mean   | ...  | ...  | ...  | ...  | ...  | ...  |... |
+| Std    | ...  | ...  | ...  | ...  | ...  | ...  |... |
+```
+
+---
+
+### 阶段五：综合测试与文档完善（1-2周）
+
+**目标**：全面验证改造效果，完善技术文档，导出模型用于 C++ 部署
+
+#### 开发任务
+
+| 任务编号 | 任务名称 | 具体内容 | 验收标准 |
+|---------|---------|---------|---------|
+| 5.1 | 可复现性测试 | 使用不同 seed 运行多次，验证稳定性 | 结果差异 < 10% |
+| 5.2 | 消融实验 | 分别禁用各项改进，测量影响 | 量化每项改进的贡献 |
+| 5.3 | 基准对比 | 与原版 `force_estimation.py` 对比 | 达到预期改进目标 |
+| 5.4 | 参数敏感性分析 | 测试网络层数、学习率等超参数 | 给出最优参数建议 |
+| **5.5** | **模型导出功能** | **添加 TorchScript/ONNX 模型导出；保存归一化参数为 JSON** | **生成 `.pt`/`.onnx` 模型文件 + `normalizer_params.json`** |
+| **5.6** | **C++ 推理验证** | **编写简单的 C++ 测试程序验证模型加载和推理** | **C++ 推理结果与 Python 一致（误差 < 1e-6）** |
+| 5.7 | 用户文档编写 | 编写 README 和使用说明，包含模型导出和部署指南 | 新用户可独立运行训练和部署 |
+
+**交付物**：
+- 可复现性测试报告
+- 消融实验对比表
+- 基准测试对比报告
+- **导出的模型文件**：
+  - `force_estimator_model.pt` (PyTorch TorchScript)
+  - `force_estimator_model.onnx` (ONNX 格式，可选)
+  - `normalizer_params.json` (归一化参数)
+- **C++ 推理测试代码** (`test_cpp_inference.cpp`)
+- 用户使用手册（README.md，包含模型部署章节）
+
+**消融实验设计**：
+```
+实验组 1: 完整改造版（基准）
+实验组 2: 禁用混合几何采样
+实验组 3: 禁用固定归一化
+实验组 4: 禁用动态权重
+实验组 5: 禁用残差归一化
+实验组 6: 原版（对照组）
+```
+
+---
+
+### 开发时间线总览
+
+```
+Week 1-2:  阶段一 - 数据处理重构 + 特征精简
+Week 3-4:  阶段二 - 几何采样改造
+Week 5-7:  阶段三 - 残差归一化与权重平衡
+Week 8:    阶段四 - 评估与可视化
+Week 9-10: 阶段五 - 测试、文档与模型导出
+```
+
+**总预计工期**：10 周（约 2.5 个月）
+
+---
+
+### 阶段晋级标准（Gate Criteria）
+
+为确保每个阶段的质量，设立以下**必达标准**，未通过则不得进入下一阶段：
+
+#### 阶段一 → 阶段二
+
+**必达标准**：
+- ✅ 数据加载可复现（使用相同 seed + sample-size 得到完全一致的数据）
+- ✅ 归一化统计缓存有效（验证测试1-3全部通过）
+- ✅ 特征维度成功调整为 13-18 维（含 thrust 为动态量）
+- ✅ `ConstantManager` 类正常工作，能正确返回批次常量
+- ✅ 数据质量检查报告无异常（单位、量纲、异常值检测通过）
+
+**验收方式**：
+```bash
+# 运行验证脚本
+python test_phase1.py --validate-all
+# 应输出: All Phase 1 tests passed ✓
+```
+
+---
+
+#### 阶段二 → 阶段三
+
+**必达标准**：
+- ✅ 域内采样无异常聚集（通过 2D/3D 可视化验证）
+- ✅ **混合几何残差方差相比 Hypercube 降低 ≥30%**（阶段晋级最低门槛）
+- ✅ 残差方差对比报告 `geometry_comparison.csv` 生成
+- ✅ `ConstantManager` 成功集成到采样流程（无重复实现）
+
+**优秀标准**（非必须，但建议达成）：
+- ⭐ 混合几何残差方差降低 ≥50%（理想目标）
+
+**验收方式**：
+```bash
+# 运行对比实验
+python compare_geometry_sampling.py --baseline=hypercube --new=mixed
+# 应输出:
+#   Variance reduction: XX%
+#   Status: PASS (≥30%) 或 EXCELLENT (≥50%)
+```
+
+**若未达标（<30%）**：
+- 调整几何采样方案（尝试不同的时间域范围）
+- 检查常量拼接逻辑是否正确
+- 考虑回退至 Hypercube + 残差归一化方案
+
+---
+
+#### 阶段三 → 阶段四
+
+**必达标准**：
+- ✅ PDE 残差量级降至 1e0–1e3（至少降至 1e3，目标 1e0-1e2）
+- ✅ 训练 1000 steps 无 NaN/Inf 出现
+- ✅ `MetricsLogger` 正常记录所有关键指标
+- ✅ r1:r2:r3 残差比值 < 10³（量级基本平衡）
+- ✅ 梯度范数保持在 1e-6 ~ 1e3 范围内
+
+**验收方式**：
+```bash
+# 运行稳定性测试
+python train_with_monitoring.py --iterations=1000 --check-stability
+# 检查日志输出:
+#   - PDE loss: O(1e0-1e3) ✓
+#   - No NaN/Inf detected ✓
+#   - Gradient norm: [1e-6, 1e3] ✓
+```
+
+**若未达标**：
+- 回退至静态权重优化 (Task 3.2)
+- 检查残差归一化是否正确实现
+- 调整学习率或优化器配置
+
+---
+
+#### 阶段四 → 阶段五
+
+**必达标准**：
+- ✅ 所有可视化指标正常生成（loss 曲线、残差分布图）
+- ✅ 残差评估报告 `force_estimation_residual_metrics.csv` 完整
+- ✅ MAE/RMSE/Mean/Std 指标均已计算
+- ✅ ADAM 与 L-BFGS 两阶段的 loss 曲线清晰可辨
+
+**验收方式**：
+```bash
+# 检查输出文件
+ls logs/train_plot_adam.png logs/train_plot_lbfgs.png logs/force_estimation_residual_metrics.csv
+# 应显示所有文件存在
+
+# 验证 CSV 格式
+python validate_metrics.py --csv=logs/force_estimation_residual_metrics.csv
+# 应输出: Metrics file valid ✓
+```
+
+---
+
+#### 阶段五完成标志
+
+**必达标准**：
+- ✅ 模型导出成功（`.pt` 或 `.onnx` 文件生成）
+- ✅ C++ 推理误差 < 1e-6（相对误差 < 0.1%）
+- ✅ 消融实验完成，量化了每项改进的贡献
+- ✅ 用户文档完整（README.md 包含训练和部署说明）
+- ✅ **最终目标达成**: PDE 残差降至 1e0-1e2
+
+**验收方式**：
+```bash
+# C++ 推理一致性测试
+./test_cpp_inference --model=force_estimator_model.pt --test-samples=100
+# 应输出: Average inference error: <1e-6 ✓
+
+# 整体效果验证
+python final_validation.py --compare-with-original
+# 应输出:
+#   Original PDE residual: O(1e26)
+#   Improved PDE residual: O(1e0-1e2)
+#   Improvement: 24+ orders of magnitude ✓
+```
+
+---
+
+### 每阶段验收标准总结
+
+| 阶段 | 核心指标 | 最低门槛 (Gate) | 理想目标 |
+|------|---------|----------------|---------|
+| 阶段一 | 数据加载可复现性 + 特征维度精简 | 100% 相同结果 + 输入维度调整为 13-18 维（含 thrust） | 同左 |
+| 阶段二 | PDE 残差方差降低 | **≥30%** | **≥50%** |
+| 阶段三 | 残差量级平衡 | r1:r2:r3 比值 < 10³ | r1:r2:r3 比值 < 10² |
+| 阶段四 | 可视化完整性 | 所有关键指标可视化 | 同左 |
+| **阶段五** | **整体改进效果 + 模型可部署性** | **PDE 残差降至 1e0-1e2 + C++ 推理误差 < 1e-6** | **PDE 残差降至 1e0-1e1** |
+
+**说明**：
+- **最低门槛 (Gate)**: 未达标则不得进入下一阶段
+- **理想目标**: 达成则标记为"优秀"，但非强制要求
+
+---
+
+**总结：**
+ 通过①启用低维几何+混合采样、②固定随机与归一化统计、③增加残差评估与可视化，并同步修复单位与量纲问题，`force_estimation.py` 将从"物理残差爆炸不可收敛"的原型，升级为**可复现、数值稳定、可解释的 PINN 力估计系统**。
+
+---
+
+## 十、关键风险与应对策略
+
+| 阶段 | 风险 | 影响级别 | 应对措施 |
+|------|------|----------|----------|
+| **Phase 1-2** | 特征精简后物理信息丢失 | 🔴 高 | 保留完整版 (37维) 和精简版 (13维) 平行对比实验 |
+| **Phase 2** | 混合几何采样效果不明显 | 🟡 中 | 回退至 Hypercube + 残差归一化方案 |
+| **Phase 3** | 动态权重不收敛或震荡 | 🟡 中 | 回退至静态权重优化方案 (Task 3.2) |
+| **Phase 3** | 残差归一化基准选择不当 | 🟡 中 | 多方案对比 (中位数/均值/RMS)，选最优 |
+| **Phase 5** | C++ 模型格式不兼容 | 🟡 中 | ONNX Runtime 作为备选方案 |
+| **Phase 3-5** | 总体方案失败，残差仍爆炸 | 🔴 高 | 紧急降级：简化物理约束（仅保留 r1）或回退至原始方法 |
+
+**风险监控指标**：
+- **Phase 1**: 特征相关性矩阵（检测是否遗漏关键特征）
+- **Phase 2**: 残差方差降低百分比（目标 >30%）
+- **Phase 3**: 训练 loss 曲线平滑度（检测震荡）
+- **Phase 5**: Python vs C++ 推理误差（目标 <1e-6）
+
+---
+
+## 十一、后续扩展方向
+
+基于当前改造的成功经验，可进一步扩展以下功能：
+
+### 1. 自动化数据质量检查模块
+
+**功能描述**：
+- 自动检测输入数据的单位、量纲、分布异常
+- 生成数据健康报告（Data Sanity Check）
+- 支持自定义检查规则（YAML 配置）
+
+**优先级**: 🟢 低（Phase 5 之后）
+
+---
+
+### 2. 自适应权重调度器（Adaptive Weight Scheduler）
+
+**功能描述**：
+- 动态平衡各物理分支（r1/r2/r3）的权重
+- 支持多种调度策略：
+  - RMS-based: `weight_i = 1 / RMS_i`
+  - GradNorm: 基于梯度范数平衡
+  - Uncertainty-based: 基于残差不确定性调整
+
+**优先级**: 🟡 中（Phase 3 备选方案）
+
+---
+
+### 3. 实时训练监控仪表盘
+
+**功能描述**：
+- 基于 TensorBoard 或 Weights & Biases 的实时监控
+- 可视化内容：
+  - 残差分布热力图
+  - 梯度流动图（检测梯度消失/爆炸）
+  - 权重演化曲线
+  - 物理残差分量对比
+
+**优先级**: 🟢 低（Phase 4 可选扩展）
+
+---
+
+### 4. 多保真度神经网络（PINN v3）
+
+**功能描述**：
+- 联合估计风场参数与载荷扰动
+- 结合低保真度仿真数据和高保真度实验数据
+- 使用 DeepXDE 的 `MFNN` 架构
+
+**应用场景**：
+- 场景1: 使用简化物理模型生成大量低保真度数据
+- 场景2: 使用少量高保真度飞行实验数据微调
+
+**优先级**: 🔴 高（独立项目，建议作为 Phase 6）
+
+---
+
+### 5. 物理约束软化与混合优化
+
+**功能描述**：
+- 支持"软约束"模式：允许物理残差在可接受范围内
+- 混合方法：神经网络初始化 + L-BFGS 微调
+- 提供实时性与物理严格性的权衡选项
+
+**应用场景**：
+```python
+# 模式1: 纯神经网络（最快，~0.1 ms）
+force_estimate = model.predict(state)
+
+# 模式2: 混合方法（平衡，~1-2 ms）
+initial_guess = model.predict(state)
+force_estimate = lbfgs_refine(initial_guess, physics_constraints)
+
+# 模式3: 严格优化（最准，~5-10 ms）
+force_estimate = lbfgs_optimize(state, physics_constraints)
+```
+
+**优先级**: 🟡 中（C++ 部署后的性能优化方向）
+
+---
+
+### 扩展优先级总结
+
+| 扩展项 | 优先级 | 预计工期 | 依赖阶段 |
+|--------|--------|----------|----------|
+| 自动化数据质量检查 | 🟢 低 | 1-2 周 | Phase 5 完成后 |
+| 自适应权重调度器 | 🟡 中 | 1 周 | Phase 3 内部 |
+| 实时训练监控仪表盘 | 🟢 低 | 1 周 | Phase 4 内部 |
+| 多保真度神经网络 (v3) | 🔴 高 | 4-6 周 | Phase 5 完成后（独立项目） |
+| 物理约束软化与混合优化 | 🟡 中 | 2-3 周 | C++ 部署完成后 |
+
+---
+
+## 阶段三（Task 3.0–3.4）实施与交付（已完成）
+
+本阶段聚焦于训练监控、残差归一化、损失权重平衡与梯度监控，已完成如下工作并通过演示与测试验证：
+
+- 3.0 监控基础设施 MetricsLogger
+  - 以 CSV 记录每个 step 的关键指标：总 train/test loss、PDE 分量未加权 MSE/RMS（按 r1/r2/r3 展开）、各分量 loss 权重，支持全局梯度 L2 记录。
+  - 默认输出：`logs/training_metrics.csv`；可通过 `--metrics-csv` 自定义。
+
+- 3.1 残差归一化 ResidualScaler
+  - 数据驱动自动估计归一尺度，支持 `median`/`mean` 模式；亦可通过 `--residual-scale-r{1,2,3}` 覆盖。
+  - 物理启发的尺度：r1 ∝ (m_Q + m_L) g；r2 ∝ lever × (m_Q + m_L) g（lever 来自 l_length 或 |ρ|）；r3 ∝ |ρ|。
+  - CLI：`--residual-norm-mode {off,median,mean}`。
+
+- 3.2 静态损失权重
+  - 模式：`manual` 与 `inverse_residual`（根据残差尺度的反比设定），并可手动覆盖 `--loss-weight-r{1,2,3}` 与 `--bc-loss-weight`。
+
+- 3.3 动态权重调度器 AdaptiveWeightScheduler
+  - 基于每分量 RMS 的 EMA 动态平衡权重，受 `--adaptive-weight-{period,alpha,min,max}` 控制，支持上下界与归一。
+  - 通过 `--adaptive-weights` 启用。
+
+- 3.4 梯度监控 GradientNormMonitor
+  - 基于 PyTorch 的全局梯度 L2 范数监控与 CSV 记录，支持上下阈与停止耐心（`--grad-norm-{min,max}`，`--grad-monitor-patience`）。
+  - 与 MetricsLogger 集成，便于关联观察损失与梯度动态。
+
+目录与兼容性
+- 新增 `estimation/` 包，包含 `cli.py / physics.py / data_utils.py / geometry_utils.py / training.py / metrics_logger.py / gradient_monitor.py / weight_scheduler.py` 等模块；包装入口 `estimation/force_estimation.py`。
+- 兼容旧路径：`examples/pinn_inverse/*.py` 提供重导出（re-export）以保证历史示例可用。
+- 默认数据集路径：`estimation/datasets/force_estimation_train.csv`（可用 `--data` 或环境变量 `FORCE_ESTIMATION_DATA` 覆盖）。
+
+演示与测试
+- Demo 命令（PyTorch）：
+  `DDE_BACKEND=pytorch python3 estimation/force_estimation.py --demo --seed 42 --sample-size 64 --max-points 64 --adam-iters 5 --disable-lbfgs --num-domain 64 --skip-unit-check --metrics-csv logs/training_metrics.csv --residual-variance-path logs/residual_variance.csv --grad-monitor`
+- 运行测试：`python3 -m pytest tests`
+
+状态与后续
+- 阶段三（3.0–3.4）功能已实现并验证；建议在阶段四集中完善文档与 CLI 帮助文案、参数分组显示等易用性细节。
+
+## 附录：修订历史
+
+**v2.1 (2025-11-10)**:
+- ✅ 修复双重"九"标题结构错误
+- ✅ 重写阶段一验证方法（增加缓存复用测试）
+- ✅ 在阶段二增加残差方差计算工具和对比报告
+- ✅ 在阶段三前置监控基础设施 (Task 3.0)
+- ✅ 澄清阶段一/阶段二的 `ConstantManager` 接口关系
+- ✅ 新增"阶段晋级标准"章节
+- ✅ 新增"关键风险与应对策略"章节
+- ✅ 恢复并扩展"后续扩展方向"章节
+
+**v2.0 (原始版本)**:
+- 初始版本，定义五阶段开发计划

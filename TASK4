@@ -1,0 +1,208 @@
+任务：实施方案【【1】】下的 force_estimation PINN 改造
+
+一、目标速览
+- 扩展数据记录与特征工程，使 PINN 输入覆盖无人机/负载状态、缆绳信息与物理常量。
+- 调整网络输出与损失函数，仅估计外力 `f_L`、`f_Q`，并保留物理约束。
+- 引入基于物理范围的归一化与新网络结构（MLP baseline，时序模型可选）。
+
+二、现状摘要
+- `FEATURE_COLUMNS`：32 维（时间 + UAV/负载位置、速度、加速度 + 9 维姿态矩阵 + 推力 + 质量 + 重力），多处 `IDX_*` 切片依赖顺序。
+- `OUTPUT_DIM = 9`，预测 `f_Q`、`f_L`、`rho`；`Force_estimation` 中使用 rho 及完整旋转矩阵计算三类残差（动力学、力矩、正交）。
+- `OBSERVATION_COLUMNS` 自动生成 PointSetBC，只要列存在即纳入监督。
+- 归一化：Z-score `Normalizer`，支持 `inverse_tensor`；Demo 数据亦基于该标准化。
+- 网络：`dde.nn.FNN`（tanh，5 层）；
+- 损失权重：仅覆盖 PDE 残差（r1/r2/r3 + 可选 rho_unit）。
+
+4. 训练与评估
+训练：python3 examples/pinn_inverse/force_estimation.py --data examples/pinn_inverse/datasets/force_estimation_train.csv
+评估：训练后，用脚本或单独的 notebook 调 model.predict() 读取 force_estimation_test.csv，计算误差（以后可以考虑在 force_estimation.py 内新增 --test-data 参数自动完成）。
+
+如何使用
+
+仅用训练集训练并在训练集上导出预测
+命令：python examples/pinn_inverse/force_estimation.py --data examples/pinn_inverse/datasets/force_estimation_train.csv
+结果文件：与训练集同目录下生成 force_estimation_prediction.csv。
+仅用测试集训练并在测试集上导出预测（注意：会重新训练一次）
+命令：python examples/pinn_inverse/force_estimation.py --data examples/pinn_inverse/datasets/force_estimation_test.csv
+同时读入 train 与 test（合并后整体训练与预测）
+命令：python examples/pinn_inverse/force_estimation.py --data examples/pinn_inverse/datasets
+会合并目录中所有包含必要列的 CSV 后训练与预测，结果导出到该目录。
+
+
+三、需求解析
+1. 特征扩展
+   - 新增角速度、机体系加速度、缆绳方向、参数常量等；目标维度约 37。
+   - 必须明确字段顺序和命名，以重建 `IDX_*`。
+2. 输出重构
+   - PINN 仅输出 `f_L`、`f_Q` 六维；缆绳方向改为输入。
+3. 归一化
+   - 按方案【【1】】给定物理范围，将变量缩放至 [-1, 1]。
+   - 需保证 `inverse_tensor` 与 Demo 数据生成逻辑仍可用。
+4. 物理残差
+   - 重新推导 tension 消元：`m_Q a_Q = f_thrust + f_Q - λρ`、`m_L a_L = f_L + λρ + m_L g`。
+   - 机体系加速度需经旋转矩阵/四元数转换至世界系。
+5. 监督与评估
+   - `OBSERVATION_COLUMNS` 应排除仅用于评估的基线字段（L-BFGS）。
+   - 导出预测时只输出 6 维结果，可附加对比列。
+6. 网络结构
+   - 方案 A：三层 ReLU MLP，支持 LayerNorm/Dropout（需要自定义 DeepXDE 网络或使用后端框架）。
+   - 方案 B：时序模型（LSTM/GRU + MLP），需配合窗口化数据。
+7. 损失调度
+   - λ_data = 1.0，λ_physics = 0.1；确保 loss_weights 与 PDE 残差、PointSetBC 数量一致。
+
+四、风险与待澄清
+- 特征表未定：缺少角速度、缆绳方向、参数常量的准确范围与采样方式。
+- 姿态信息：仅有 R13/R23/R33 是否足够完成世界系转换？是否改用四元数。
+- 加速度定义：IMU 数据是否已包含重力；需要明确以免重复补偿。
+- DeepXDE 网络扩展：LayerNorm/Dropout 需手动实现；需评估复杂度。
+- 时序方案：窗口化逻辑、批处理维度、推理时历史缓存均待设计。
+
+五、实施路线
+阶段 1：数据契约
+- 数据放置：上游仿真/真实飞行日志只需复制到 `examples/dataset/pinn-plot/`（或任意目录），再运行 `examples/pinn_inverse/pinn_data_recorder.py --src <raw_dir> --dst examples/pinn_inverse/datasets/force_estimation_sample.csv` 即可同步到 PINN 样例；不再需要跨项目引用 `src/AutoTrans/.../plots`。
+- 特征表：统一采用 37 维输入 + 6 维监督，遵循 `time → UAV → 角速度 → 载荷 → 缆绳 → 姿态 → 推力/常量 → 环境 → 监督` 顺序。各字段配置如下（范围基于 `pinn_dataset_circle-c1_low_20251104182953_2_9978.csv`，保留 0.1 安全裕度）：
+  1. 时间 `time` ← `timestamp`（秒），归一化为首样本起点，范围 `0 ~ 120.8`。
+  2. UAV 位置/速度 `xQ_*`/`vQ_*` ← `quad_pos_*`/`quad_vel_*`，单位 m、m/s，范围 `[-3.1, 3.1]`、`[-2.6, 2.9]`。
+  3. UAV 加速度 `accQ_*` ← `quad_acc_*`（含重力补偿），单位 m/s²，XY `[-1.6, 0.9]`、Z `7.0 ~ 19.7`。
+  4. 角速度 `omega_b_*` ← `quad_omega_*`，单位 rad/s，范围 `[-12.5, 10.4]`。
+  5. 载荷状态 `xL_*`/`vL_*`/`accL_*` ← `load_pos_*`/`load_vel_*`/`load_acc_*`，单位 m、m/s、m/s²，位置 `[-3.2, 3.2]`，速度 `[-2.9, 2.9]`，加速度 Z `6.5 ~ 19.4`。
+  6. 缆绳方向 `rho_*` ← `cable_dir_*`，无量纲，范围 `[-1, 1]`。
+  7. 姿态第三列 `ez_world_*` ← `quad_rot_r13/23/33`，无量纲，范围 `[-0.31, 0.40]`（XZ）与 `0.91 ~ 1.00`（Z）。
+  8. 推力与常量：`thrust` ← `thrust_total`（N，`10 ~ 27`）；`m_Q`、`m_L` 直接采集（kg）；`g` 常量 9.81；`l_length`、`sqrt_kf` 原样复制。
+  9. 环境风场 `wind_x/y/z` ← `wind_*`（m/s，`[-1.0, 1.3]`）。
+ 10. 监督信号 `fQ_*`、`fL_*` ← `fq_true_*`、`fl_true_*`（N，约 `[-0.12, 0.10]`）。
+- 样例 CSV：`examples/pinn_inverse/datasets/force_estimation_sample.csv`，由上述数据记录器对 `examples/dataset/pinn-plot/pinn_dataset_circle-c1_low_20251104182953_2_9978.csv` 生成，保证列顺序与范围可直接喂入 PINN。
+- 数据记录器：新增 `examples/pinn_inverse/pinn_data_recorder.py`，统一完成字段映射、单位校验、范围截断与缺失值填充。
+
+阶段 2：基础代码重构
+- `examples/pinn_inverse/force_estimation.py` 已落地 37 维输入/6 维输出：完整更新 `FEATURE_COLUMNS`、所有 `IDX_*`，残差函数改用输入中的缆绳方向与姿态第三列。
+- 观测约束调整：`OBSERVATION_COLUMNS` 仅保留真实力标签，`build_observation_bcs` 自动跳过缺失列，避免把基线估计写入监督。
+- 归一化与 Demo：替换为 Min-Max 归一器（映射至 [-1,1]，含 `inverse_tensor` 支持），并重写 Demo 生成逻辑以覆盖角速度/缆绳/风场等新增特征，同时附加占位监督列确保 `--demo` 模式可跑通。
+
+阶段 3：物理残差升级
+- `Force_estimation` 现直接依赖输入特征重构物理量：`rho`、`ez_world`、`accQ/accL`、`m_Q/m_L`、`thrust`、`g` 等统一通过逆归一化后的张量取值，残差仍在世界坐标系中求解。
+- 三类残差按照需求重新整理：动力学平衡 `r1 = f_Q + f_L - m_Q(g e_z^w + ẍ_Q) + m_L(g e_z^w + ẍ_L)`；力矩平衡 `r2 = ρ × f_Q - ρ × (f R e_z^w - m_Q g e_z^w - m_Q ẍ_Q)`；载荷约束 `r3 = f_L · ρ`。
+- 与输出维度一致的 `loss_weights` 已同步，后续阶段可直接在此基础上叠加新的物理约束或监督项。
+
+阶段 4：网络与训练
+- 方案 A：自定义 MLP（含 LayerNorm/Dropout），配置 λ_data/λ_physics。
+- 方案 B（可选）：实现窗口化数据处理与时序网络。
+- 配置训练流程（Adam + L-BFGS）、模型保存与回调。
+
+阶段 5：验证与交付
+- 使用 Demo 与真实数据跑通训练；检查残差、监督误差收敛。
+- 导出预测 CSV（6 维输出 + 可选基准对比）。
+- 编写评估脚本，比较 PINN 方案与 L-BFGS 基线。
+- 整理最终文档：特征表、归一化范围、损失公式、训练步骤、评估结果。
+
+六、交付要求
+- 代码：完成 `force_estimation.py` 重构、新建数据记录器、更新数据样例与网络定义。
+- 文档：包含特征/标签定义、归一化策略、残差推导、训练配置、评估流程。
+- 验证：提供至少一次训练日志和预测结果示例，说明物理约束与数据拟合的效果。
+
+结论：需先锁定数据字段与物理假设，再逐步重构 `force_estimation.py`。按照阶段计划推进，可在保证可验证性的同时，平滑引入方案【【1】】的目标功能。
+
+七、训练加速与大规模数据集策略（GPU/多数据集）
+- 核心思路：将“每次训练参与的样本量”限制在可控规模内，并周期性重采样，而不是一次性把全部数据喂入。这样即使加入100个数据集，单步耗时基本不变，只是为覆盖更广分布需要更多训练步数。
+
+- 精度与设备
+  - 后端：优先使用 PyTorch（已在本地验证 GPU 可用）。
+  - 精度：调试/大规模训练建议切换为 float32（速度和显存更友好）；需要精细对齐再回到 float64。
+
+- PDE 点（域内点）控制与重采样
+  - 不再把所有样本都作为 `anchors`。使用 `num_domain` 指定每周期参与训练的 PDE 点数（如 8k/16k/32k），并周期性重采样。
+  - 训练回调：加入 `dde.callbacks.PDEPointResampler(period=100, pde_points=True, bc_points=True)`，每 100 步重采 PDE/BC 训练点，提升覆盖面、避免过拟合某批点。
+
+- 监督点（PointSetBC）mini-batch（PyTorch 支持）
+  - 为 `PointSetBC` 设置 `batch_size`（如 8192），使每个训练周期只抽取一批监督点参与损失；结合上面的回调（`bc_points=True`）实现按周期更换监督批次。
+  - 如监督点总量极大，可在读入时做随机下采样（例如最多 200 万行），或在 CLI 提供 `--max-points` 控制上限。
+
+- 已新增 CLI 参数（兼容旧用法，默认与原脚本一致）
+  - `--float32`：切换 float32 精度；默认 false（float64）。
+  - `--num-domain`：每步额外采样的 PDE 域内点数；默认 0（仅用 anchors）。
+  - `--bc-batch`：PointSetBC mini-batch 大小；默认 0（使用全部监督点，PyTorch/Paddle 下才生效）。
+  - `--resample-period`：`dde.callbacks.PDEPointResampler` 触发周期；默认 0（禁用）。
+  - `--max-points`：多 CSV 合并后最多保留的样本数；超过时随机抽样并按时间排序，默认 None（全量使用）。
+  - `--early-patience` / `--early-min-delta`：配置 `dde.callbacks.EarlyStopping`；默认 0 / 0.0（禁用）。
+
+- 代码改动要点（已落地）
+  - `main()` 在解析 CLI 后，根据 `--float32` 调整 `dde.config.set_default_float`，后续 `load_dataset` 与 `Normaliser` 全程跟随 dtype。
+  - `load_dataset()` 支持 `max_points` 下采样，并在 demo/真实数据路径下保持 dtype 一致；`build_observation_bcs()` 现在接收 `batch_size` 与 dtype，统一生成 `PointSetBC(batch_size=...)`。
+  - 构建 `dde.data.PDE` 时沿用 anchors，同时按 `--num-domain` 设定域内采样数量；`train_model()` 接受额外回调，对 Adam 与 L-BFGS 两阶段共享 EarlyStopping / PDEPointResampler。
+  - 启动时新增一行日志 `dtype/num_domain/bc_batch/resample/max_points/early_stopping`，便于排查配置差异。
+
+- 运行示例（单 GPU / 目录包含多 CSV）
+  - `CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. DDE_BACKEND=pytorch \
+     python3.9 -m examples.pinn_inverse.force_estimation \
+       --data examples/pinn_inverse/datasets \
+       --float32 --num-domain 16384 --bc-batch 8192 \
+       --resample-period 100 --max-points 2000000`
+
+- 预期效果
+  - 单步显存/计算开销主要由 `num_domain + bc_batch ×（监督分量数）` 决定，与总数据集数量无关；加入 100 份数据不会线性拖慢每步，仅会增加达到同等误差所需的训练步数。
+  - float32 + GPU 可显著提升吞吐；必要时再切回 float64 稳定精度。
+
+ - 注意事项
+  - `PointSetBC.batch_size` 仅在 PyTorch/Paddle 生效；切换到 TensorFlow 需去掉该参数或采用其它策略。
+  - `PDEPointResampler` 会校验 `num_bcs` 是否变化；若批量策略改变了 BC 采样点数量，需要在采样逻辑中保持每个周期各个 BC 的样本数一致，或重编译模型以更新损失项长度。
+  - 多数据集归一化：建议先统计全局 min/max（或按“安全裕度”扩展），以免各数据集尺度差异影响训练稳定。
+
+——
+
+附录：`examples/pinn_inverse/force_estimation.py` 代码要点（论文描述用）
+
+目的与范围
+- 目标：利用 PINN 估计四旋翼与悬挂载荷之间的未知相互作用力 `f_Q` 与 `f_L`（共 6 维）。
+- 后端：DeepXDE（兼容 tensorflow/tf1/pytorch/paddle）。默认 float64，支持经 CLI 切换为 float32（提高吞吐）。
+
+数据与配置
+- `FEATURE_COLUMNS`（37 维）：时间、UAV/载荷位置/速度/加速度、机体系角速度、缆绳方向 `rho`、机体 z 轴在世界系方向 `ez_world`、推力/质量/重力/缆长/`sqrt_kf`、风场分量。
+- `OBSERVATION_COLUMNS`：若包含 `f_Q`/`f_L` 真值，自动生成 `PointSetBC` 监督；在 PyTorch/Paddle 下可通过 `--bc-batch` 启用 mini-batch。
+- `LOSS_WEIGHTS`：r1、r2、r3 残差权重；`SUPERVISION_WEIGHT` 监督项权重。
+- `NETWORK_CONFIG`：FNN 深度/宽度/激活/初始化（默认 5×128、tanh、Glorot）。
+- `TRAINING_CONFIG`：Adam 迭代与学习率、是否启用 L-BFGS、Checkpoint 路径。
+- CLI 扩展：`--float32`、`--num-domain`、`--bc-batch`（仅 PyTorch/Paddle 生效）、`--resample-period`、`--max-points`、`--early-patience/--early-min-delta`。
+
+归一化与工具
+- `Normalizer`：按列 min–max 缩放至 [-1, 1]；dtype 跟随 CLI（float32/float64），并提供 `inverse` 与 `inverse_tensor`。切换 dtype 时内部缓存自动重建。
+- `cross_product(a,b)`：后端无关的三维向量叉积。
+- `build_observation_bcs(df, anchors, batch_size, dtype)`：按列创建多分量 `PointSetBC`，可选 `batch_size`（监督小批）与 dtype。
+
+物理残差（核心）
+- `build_force_estimation_residual(normalizer)`：
+  - 输入 `x` 为归一化特征，经 `normalizer.inverse_tensor` 还原；输出 `y` 为 `[f_Q(3), f_L(3)]`。
+  - r1（线动量守恒）：`r1 = f_Q + f_L - m_q (g + a_q) + m_l (g + a_l)`。
+  - r2（以缆绳方向为力矩臂的力矩平衡）：`aero_term = thrust * ez_world - m_q g - m_q a_q`，`r2 = ρ × f_Q − ρ × aero_term`。
+  - r3（缆绳方向正交）：`r3 = <f_L, ρ>`。
+  - 返回 7 个标量残差：[r1x,r1y,r1z,r2x,r2y,r2z,r3]。
+
+数据加载与几何/网络
+- `load_dataset(path, use_demo, max_points, dtype)`：
+  - `--demo` 时生成可复现实验的合成样例；否则读取文件或合并目录下所有完整 CSV。
+  - 若 `max_points` 非空，合并后随机抽样至该上限并按 `time` 排序；归一化统计与输出特征均采用指定 dtype。
+  - 返回 `df`、`features_norm`、`normalizer`。
+- `build_geometry(features_norm)`：按归一化特征的 min/max 构建 `Hypercube`，零跨度维度加微扰。
+- `build_network()`：构建 `dde.nn.FNN([37] + [width]*depth + [6])`。
+
+训练与导出
+- `build_loss_weight_vector(num_bcs)`：拼接 PDE 残差与监督项的权重，保证长度匹配。
+- `train_model(model, num_bcs, extra_callbacks)`：
+  - Adam：`model.compile("adam")` → 迭代 `adam_iterations`，保留 `ModelCheckpoint(save_better_only=True, period=1000)`。
+  - L-BFGS：`model.compile("L-BFGS")` → 二阶段精调；`extra_callbacks`（如重采样/早停）在两阶段均启用。
+- `evaluate_model(model, anchors, df, out_dir)`：在 anchors 上预测并导出 `force_estimation_prediction.csv`，包含 `[fQ_hat_*, fL_hat_*]` 与可选真值列，保留首列 `time`。
+
+主程序与使用方式
+- 流程：解析 CLI（含 dtype/采样/早停） → `load_dataset(..., dtype)` → 生成 anchors/几何 → `build_observation_bcs(..., batch_size, dtype)` → 定义 PDE 残差 → `dde.data.PDE(..., num_domain)` → 组装回调（`PDEPointResampler(period, pde_points, bc_points)`、`EarlyStopping`）→ 打印运行配置行（dtype/num_domain/bc_batch/resample/max_points/early）→ 训练 → 导出预测。
+- 运行示例：
+  - 演示：`python3 examples/pinn_inverse/force_estimation.py --demo`。
+  - 单 CSV：`python3 examples/pinn_inverse/force_estimation.py --data examples/pinn_inverse/datasets/force_estimation_sample.csv`。
+  - 合并目录（GPU + 加速配置示例）：
+    - `CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. DDE_BACKEND=pytorch \
+       python3 -m examples.pinn_inverse.force_estimation \
+         --data examples/pinn_inverse/datasets \
+         --float32 --num-domain 16384 --bc-batch 8192 \
+         --resample-period 100 --max-points 2000000 \
+         --early-patience 2000 --early-min-delta 1e-4`
+
+与 AutoTrans 数据的契合
+- 该脚本预期的 37 维特征列与 `batch_data_collection.py` 生成的 `pinn_dataset_*.csv` 一致；若列名/顺序一致，可直接指向包含这些 CSV 的目录进行训练与评估。
