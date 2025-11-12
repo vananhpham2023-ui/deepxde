@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 import deepxde as dde
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import deepxde.backend as bkd
 
 try:  # pragma: no cover
@@ -45,6 +46,7 @@ try:  # pragma: no cover
         build_residual_scaler as physics_build_residual_scaler,
         compute_residual_components_numpy as physics_compute_residual_components_numpy,
         compute_residual_variance_table as physics_compute_residual_variance_table,
+        compute_residual_metrics_numpy as physics_compute_residual_metrics_numpy,
     )
 except ImportError:  # pragma: no cover
     from physics import (  # type: ignore
@@ -55,6 +57,7 @@ except ImportError:  # pragma: no cover
         build_residual_scaler as physics_build_residual_scaler,
         compute_residual_components_numpy as physics_compute_residual_components_numpy,
         compute_residual_variance_table as physics_compute_residual_variance_table,
+        compute_residual_metrics_numpy as physics_compute_residual_metrics_numpy,
     )
 
 try:  # pragma: no cover
@@ -173,6 +176,10 @@ AUXILIARY_COLUMNS: List[str] = ["m_Q", "m_L", "g", "l_length"]
 MINIMAL_FEATURE_COLUMNS: List[str] = FEATURE_COLUMNS + AUXILIARY_COLUMNS
 DEFAULT_SAMPLE_PLOT_DIR = os.path.join("plots", "sampling")
 DEFAULT_RESIDUAL_VARIANCE_PATH = os.path.join("logs", "residual_variance.csv")
+DEFAULT_RESIDUAL_METRICS_PATH = os.path.join("logs", "force_estimation_residual_metrics.csv")
+DEFAULT_RESIDUAL_PLOT_DIR = os.path.join("logs", "residual_plots")
+DEFAULT_TRAIN_PLOT_DIR = os.path.join("logs")
+DEFAULT_TRAIN_PLOT_PREFIX = "train_plot"
 
 # 可选观测列，用于 PointSetBC 监督（存在时自动启用）
 OBSERVATION_COLUMNS: Dict[str, Dict[str, List[str] | int]] = {
@@ -356,6 +363,7 @@ def compute_residual_variance_table(
     df: pd.DataFrame,
     predictions: np.ndarray,
     residual_scaler: ResidualScaler | None = None,
+    residual_matrix: np.ndarray | None = None,
 ) -> pd.DataFrame:
     return physics_compute_residual_variance_table(
         df,
@@ -363,6 +371,23 @@ def compute_residual_variance_table(
         feature_columns=FEATURE_COLUMNS,
         context=RESIDUAL_CONTEXT,
         residual_scaler=residual_scaler,
+        residual_matrix=residual_matrix,
+    )
+
+
+def compute_residual_metrics_numpy(
+    df: pd.DataFrame,
+    predictions: np.ndarray,
+    residual_scaler: ResidualScaler | None = None,
+    residual_matrix: np.ndarray | None = None,
+) -> pd.DataFrame:
+    return physics_compute_residual_metrics_numpy(
+        df,
+        predictions,
+        feature_columns=FEATURE_COLUMNS,
+        context=RESIDUAL_CONTEXT,
+        residual_scaler=residual_scaler,
+        residual_matrix=residual_matrix,
     )
 
 CLIP_EXCLUDE_COLUMNS = {"time"}
@@ -485,6 +510,38 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "type": str,
             "default": DEFAULT_RESIDUAL_VARIANCE_PATH,
             "help": "残差方差统计输出 CSV 路径（留空以禁用）。",
+        },
+    ),
+    (
+        "--residual-metrics-path",
+        {
+            "type": str,
+            "default": DEFAULT_RESIDUAL_METRICS_PATH,
+            "help": "残差评估指标输出 CSV 路径（留空以禁用）。",
+        },
+    ),
+    (
+        "--residual-plot-dir",
+        {
+            "type": str,
+            "default": DEFAULT_RESIDUAL_PLOT_DIR,
+            "help": "残差分布图（直方图/箱线图）输出目录（留空以禁用）。",
+        },
+    ),
+    (
+        "--train-plot-dir",
+        {
+            "type": str,
+            "default": DEFAULT_TRAIN_PLOT_DIR,
+            "help": "保存 loss.dat/train.dat/test.dat 及训练曲线 PNG 的目录（留空以禁用）。",
+        },
+    ),
+    (
+        "--train-plot-prefix",
+        {
+            "type": str,
+            "default": DEFAULT_TRAIN_PLOT_PREFIX,
+            "help": "训练曲线 PNG 前缀（默认 train_plot_<phase>.png）。",
         },
     ),
     (
@@ -850,6 +907,136 @@ DEFAULT_SAMPLE_PLOT_SPECS: Tuple[SamplingPlotSpec, ...] = (
     SamplingPlotSpec("rho_xyz", ("rho_x", "rho_y", "rho_z")),
     SamplingPlotSpec("ez_world_xyz", ("ez_world_x", "ez_world_y", "ez_world_z")),
 )
+
+
+def _summarize_losses(sequences) -> np.ndarray:
+    if not sequences:
+        return np.zeros((0,), dtype=np.float64)
+    totals: List[float] = []
+    for entry in sequences:
+        arr = np.asarray(entry, dtype=np.float64).reshape(-1)
+        totals.append(float(np.sum(arr))) if arr.size else totals.append(0.0)
+    return np.asarray(totals, dtype=np.float64)
+
+
+def _plot_loss_history_png(loss_history, output_path: str, title: str) -> None:
+    if not output_path:
+        return
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    steps = np.asarray(getattr(loss_history, "steps", []), dtype=np.float64)
+    train_loss = _summarize_losses(getattr(loss_history, "loss_train", []))
+    test_loss = _summarize_losses(getattr(loss_history, "loss_test", []))
+    if steps.size == 0 or steps.size != train_loss.size:
+        steps = np.arange(train_loss.size, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    if train_loss.size:
+        ax.semilogy(steps[: train_loss.size], train_loss, label="Train loss")
+    if test_loss.size:
+        test_steps = steps if test_loss.size == steps.size else np.arange(test_loss.size, dtype=np.float64)
+        ax.semilogy(test_steps, test_loss, label="Test loss")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which="both", linestyle=":", linewidth=0.5)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=240)
+    plt.close(fig)
+
+
+def save_training_phase_outputs(
+    phase: str,
+    loss_history,
+    train_state,
+    *,
+    data_root: str,
+    plot_path: str,
+) -> str:
+    if loss_history is None or train_state is None:
+        return ""
+    phase_slug = (phase or "phase").lower()
+    saved_plot = ""
+    if data_root:
+        phase_dir = os.path.join(os.path.abspath(data_root), phase_slug)
+        os.makedirs(phase_dir, exist_ok=True)
+        dde.saveplot(
+            loss_history,
+            train_state,
+            issave=True,
+            isplot=False,
+            output_dir=phase_dir,
+        )
+    if plot_path:
+        phase_title = f"{phase_slug.upper()} loss history"
+        _plot_loss_history_png(loss_history, plot_path, phase_title)
+        print(f"[force_estimation] 训练曲线已保存: {plot_path}")
+        saved_plot = plot_path
+    return saved_plot
+
+
+def _extract_group_samples(residual_matrix: np.ndarray) -> Dict[str, np.ndarray]:
+    if residual_matrix.size == 0:
+        return {"r1": np.zeros((0,)), "r2": np.zeros((0,)), "r3": np.zeros((0,))}
+    groups = {
+        "r1": residual_matrix[:, 0:3].reshape(-1),
+        "r2": residual_matrix[:, 3:6].reshape(-1),
+        "r3": residual_matrix[:, 6:7].reshape(-1),
+    }
+    clean = {}
+    for key, values in groups.items():
+        arr = np.asarray(values, dtype=np.float64)
+        clean[key] = arr[np.isfinite(arr)]
+    return clean
+
+
+def generate_residual_distribution_plots(
+    residual_matrix: np.ndarray,
+    output_dir: str,
+    *,
+    bins: int = 50,
+) -> List[str]:
+    if residual_matrix.size == 0 or not output_dir:
+        return []
+    os.makedirs(output_dir, exist_ok=True)
+    groups = _extract_group_samples(residual_matrix)
+    paths: List[str] = []
+
+    hist_path = os.path.join(output_dir, "residual_hist.png")
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes = np.atleast_1d(axes).reshape(-1)
+    for ax, (label, values) in zip(axes, groups.items()):
+        if values.size == 0:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        else:
+            ax.hist(values, bins=bins, color="#1f77b4", alpha=0.85)
+        ax.set_title(f"{label.upper()} residuals")
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Count")
+        ax.grid(True, linestyle=":", linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(hist_path, dpi=240)
+    plt.close(fig)
+    paths.append(hist_path)
+
+    box_path = os.path.join(output_dir, "residual_box.png")
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.boxplot(
+        [groups["r1"], groups["r2"], groups["r3"]],
+        labels=["R1", "R2", "R3"],
+        showfliers=False,
+    )
+    ax.set_ylabel("Residual")
+    ax.set_title("Residual distribution")
+    ax.grid(True, axis="y", linestyle=":", linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(box_path, dpi=240)
+    plt.close(fig)
+    paths.append(box_path)
+    return paths
 
 def _sanitize_positive(value: float, label: str) -> float:
     val = float(value)
@@ -2013,7 +2200,7 @@ def train_model(
     model: dde.Model,
     loss_weights: List[float],
     extra_callbacks: List[dde.callbacks.Callback] | None = None,
-) -> dde.Model:
+) -> Tuple[dde.Model, Dict[str, Tuple[object, object]]]:
     adam_lr = float(TRAINING_CONFIG["adam_lr"])
     adam_iters = int(TRAINING_CONFIG["adam_iterations"])
 
@@ -2033,16 +2220,21 @@ def train_model(
             )
         )
 
-    model.train(
+    training_artifacts: Dict[str, Tuple[object, object]] = {}
+    adam_history = model.train(
         iterations=adam_iters,
         callbacks=callbacks if callbacks else None,
     )
+    if isinstance(adam_history, tuple) and len(adam_history) == 2:
+        training_artifacts["adam"] = adam_history
 
     if TRAINING_CONFIG.get("use_lbfgs", True):
         model.compile("L-BFGS", loss_weights=loss_weights)
-        model.train(callbacks=callbacks if callbacks else None)
+        lbfgs_history = model.train(callbacks=callbacks if callbacks else None)
+        if isinstance(lbfgs_history, tuple) and len(lbfgs_history) == 2:
+            training_artifacts["lbfgs"] = lbfgs_history
 
-    return model
+    return model, training_artifacts
 
 
 def evaluate_model(
@@ -2086,6 +2278,10 @@ def main():
     except ValueError as exc:
         raise SystemExit(f"[force_estimation] 采样可视化配置错误: {exc}") from exc
     residual_variance_target = (args.residual_variance_path or "").strip()
+    residual_metrics_target = (args.residual_metrics_path or "").strip()
+    residual_plot_dir = (args.residual_plot_dir or "").strip()
+    train_plot_dir = (args.train_plot_dir or "").strip()
+    train_plot_prefix = (args.train_plot_prefix or DEFAULT_TRAIN_PLOT_PREFIX).strip() or DEFAULT_TRAIN_PLOT_PREFIX
 
     if args.adam_iters is not None:
         TRAINING_CONFIG["adam_iterations"] = max(1, int(args.adam_iters))
@@ -2369,6 +2565,24 @@ def main():
             else "disabled",
         ),
         (
+            "residual_metrics",
+            os.path.abspath(residual_metrics_target)
+            if residual_metrics_target
+            else "disabled",
+        ),
+        (
+            "residual_plots",
+            os.path.abspath(residual_plot_dir)
+            if residual_plot_dir
+            else "disabled",
+        ),
+        (
+            "train_plots",
+            os.path.abspath(train_plot_dir)
+            if train_plot_dir
+            else "disabled",
+        ),
+        (
             "residual_norm",
             residual_scaler.summary() if residual_scaler else "disabled",
         ),
@@ -2456,7 +2670,19 @@ def main():
     ]
     _print_config(config_pairs)
 
-    model = train_model(model, loss_weights, extra_callbacks=callbacks)
+    model, training_artifacts = train_model(model, loss_weights, extra_callbacks=callbacks)
+    if train_plot_dir:
+        for phase, artifact in training_artifacts.items():
+            loss_history, train_state = artifact
+            png_name = f"{train_plot_prefix}_{phase}.png"
+            plot_path = os.path.join(train_plot_dir, png_name)
+            save_training_phase_outputs(
+                phase,
+                loss_history,
+                train_state,
+                data_root=train_plot_dir,
+                plot_path=plot_path,
+            )
 
     if demo_used:
         out_dir = os.getcwd()
@@ -2466,11 +2692,23 @@ def main():
         out_dir = os.path.dirname(data_path) or os.getcwd()
     preds = evaluate_model(model, anchors, df, out_dir)
 
+    need_residual_matrix = bool(
+        residual_variance_target or residual_metrics_target or residual_plot_dir
+    )
+    residual_matrix = None
+    if need_residual_matrix:
+        residual_matrix = compute_residual_components_numpy(
+            df,
+            preds,
+            residual_scaler=residual_scaler,
+        )
+
     if residual_variance_target:
         residual_table = compute_residual_variance_table(
             df,
             preds,
             residual_scaler=residual_scaler,
+            residual_matrix=residual_matrix,
         )
         residual_abs_path = os.path.abspath(residual_variance_target)
         residual_dir = os.path.dirname(residual_abs_path)
@@ -2483,6 +2721,26 @@ def main():
             for row in residual_table.itertuples()
         )
         print(f"[force_estimation] residual variance summary -> {top_summary}")
+
+    if residual_metrics_target:
+        metrics_table = compute_residual_metrics_numpy(
+            df,
+            preds,
+            residual_scaler=residual_scaler,
+            residual_matrix=residual_matrix,
+        )
+        metrics_abs_path = os.path.abspath(residual_metrics_target)
+        metrics_dir = os.path.dirname(metrics_abs_path)
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
+        metrics_table.to_csv(metrics_abs_path, index=False)
+        print(f"[force_estimation] 残差评估指标已保存: {metrics_abs_path}")
+
+    if residual_plot_dir and residual_matrix is not None:
+        plot_dir_abs = os.path.abspath(residual_plot_dir)
+        plot_paths = generate_residual_distribution_plots(residual_matrix, plot_dir_abs)
+        for path in plot_paths:
+            print(f"[force_estimation] 残差分布图已保存: {path}")
 
 
 if __name__ == "__main__":

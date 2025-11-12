@@ -140,11 +140,12 @@ def build_residual_scaler(
         lever_vals = df[context.lever_column].to_numpy(dtype=np.float64, copy=False)
         lever_candidates = np.where(np.isfinite(lever_vals), lever_vals, lever_candidates)
     lever_scale = _reduce_statistic(lever_candidates, normalized_mode, eps)
+    rho_scale = _reduce_statistic(rho_norm, normalized_mode, eps)
     torque_scale = lever_scale * force_scale
 
     scale_r1 = _apply_scale_override(force_scale, overrides.get("r1"), eps)
     scale_r2 = _apply_scale_override(torque_scale, overrides.get("r2"), eps)
-    scale_r3 = _apply_scale_override(torque_scale, overrides.get("r3"), eps)
+    scale_r3 = _apply_scale_override(rho_scale, overrides.get("r3"), eps)
 
     component_scales = np.array(
         [scale_r1, scale_r1, scale_r1, scale_r2, scale_r2, scale_r2, scale_r3],
@@ -268,14 +269,16 @@ def compute_residual_variance_table(
     feature_columns: Sequence[str],
     context: ResidualContext,
     residual_scaler: ResidualScaler | None = None,
+    residual_matrix: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    residual_matrix = compute_residual_components_numpy(
-        df,
-        predictions,
-        feature_columns=feature_columns,
-        context=context,
-        residual_scaler=residual_scaler,
-    )
+    if residual_matrix is None:
+        residual_matrix = compute_residual_components_numpy(
+            df,
+            predictions,
+            feature_columns=feature_columns,
+            context=context,
+            residual_scaler=residual_scaler,
+        )
     means = residual_matrix.mean(axis=0)
     stds = residual_matrix.std(axis=0)
     variances = residual_matrix.var(axis=0)
@@ -297,6 +300,39 @@ def compute_residual_variance_table(
     return pd.DataFrame(data)
 
 
+def compute_residual_metrics_numpy(
+    df: pd.DataFrame,
+    predictions: np.ndarray,
+    *,
+    feature_columns: Sequence[str],
+    context: ResidualContext,
+    residual_scaler: ResidualScaler | None = None,
+    residual_matrix: np.ndarray | None = None,
+) -> pd.DataFrame:
+    if residual_matrix is None:
+        residual_matrix = compute_residual_components_numpy(
+            df,
+            predictions,
+            feature_columns=feature_columns,
+            context=context,
+            residual_scaler=residual_scaler,
+        )
+    metrics = {
+        "MAE": np.mean(np.abs(residual_matrix), axis=0),
+        "RMSE": np.sqrt(np.mean(residual_matrix**2, axis=0)),
+        "Mean": residual_matrix.mean(axis=0),
+        "Std": residual_matrix.std(axis=0),
+    }
+    rows = []
+    for label in ("MAE", "RMSE", "Mean", "Std"):
+        values = metrics[label]
+        row = {"metric": label}
+        for name, val in zip(RESIDUAL_COMPONENT_NAMES, values):
+            row[name] = val
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 __all__ = [
     "RESIDUAL_COMPONENT_NAMES",
     "DEFAULT_RESIDUAL_NORM_EPS",
@@ -306,4 +342,5 @@ __all__ = [
     "build_force_estimation_residual",
     "compute_residual_components_numpy",
     "compute_residual_variance_table",
+    "compute_residual_metrics_numpy",
 ]
