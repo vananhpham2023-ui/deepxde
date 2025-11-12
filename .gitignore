@@ -1,2 +1,5 @@
 estimation/datasets/*.csv
 logs/*.csv
+__pycache__/
+*.pyc
+bfg-*.jar
