@@ -38,6 +38,21 @@ except ImportError:  # pragma: no cover
     from gradient_monitor import GradientNormMonitor  # type: ignore
 
 try:  # pragma: no cover
+    from .export_utils import (  # type: ignore
+        export_model_metadata,
+        export_normalizer_to_json,
+        export_onnx_model,
+        export_torchscript_model,
+    )
+except ImportError:  # pragma: no cover
+    from export_utils import (  # type: ignore
+        export_model_metadata,
+        export_normalizer_to_json,
+        export_onnx_model,
+        export_torchscript_model,
+    )
+
+try:  # pragma: no cover
     from .physics import (  # type: ignore
         RESIDUAL_COMPONENT_NAMES,
         ResidualContext,
@@ -476,6 +491,17 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "help": "自动模式域内点数量的上界（默认 8192）。",
         },
     ),
+    (
+        "--num-test",
+        {
+            "type": int,
+            "default": None,
+            "help": (
+                "PDE 测试阶段随机采样的域内点数量。默认 None 表示复用训练点；"
+                "0 表示与 num_domain 相同，负值表示复用训练点，正数表示显式指定。"
+            ),
+        },
+    ),
     ("--visualize-samples", {"action": "store_true", "help": "生成域内采样点的 2D/3D 可视化（Task 2.4）。"}),
     (
         "--sample-plot-dir",
@@ -542,6 +568,38 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "type": str,
             "default": DEFAULT_TRAIN_PLOT_PREFIX,
             "help": "训练曲线 PNG 前缀（默认 train_plot_<phase>.png）。",
+        },
+    ),
+    (
+        "--export-torchscript",
+        {
+            "type": str,
+            "default": "",
+            "help": "TorchScript 模型输出路径（留空以禁用）。",
+        },
+    ),
+    (
+        "--export-onnx",
+        {
+            "type": str,
+            "default": "",
+            "help": "ONNX 模型输出路径（留空以禁用，需要安装 onnx 包）。",
+        },
+    ),
+    (
+        "--export-metadata",
+        {
+            "type": str,
+            "default": "",
+            "help": "模型元数据 JSON 输出路径（留空以禁用）。",
+        },
+    ),
+    (
+        "--export-normalizer",
+        {
+            "type": str,
+            "default": "",
+            "help": "归一化参数 JSON 输出路径（留空以禁用）。",
         },
     ),
     (
@@ -2206,31 +2264,42 @@ def train_model(
 
     model.compile("adam", lr=adam_lr, loss_weights=loss_weights)
 
-    callbacks = list(extra_callbacks or [])
+    base_callbacks = list(extra_callbacks or [])
     checkpoint_path = str(TRAINING_CONFIG["checkpoint_path"])
+    adam_checkpoint = None
+    lbfgs_checkpoint = None
     if checkpoint_path:
         checkpoint_dir = os.path.dirname(checkpoint_path)
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
-        callbacks.append(
-            dde.callbacks.ModelCheckpoint(
-                checkpoint_path,
-                save_better_only=True,
-                period=1000,
-            )
+        adam_checkpoint = dde.callbacks.ModelCheckpoint(
+            checkpoint_path,
+            save_better_only=True,
+            period=1000,
         )
+        lbfgs_checkpoint = dde.callbacks.ModelCheckpoint(
+            checkpoint_path,
+            save_better_only=True,
+            period=1,
+        )
+
+    def _build_callbacks(phase_callback):
+        callbacks = list(base_callbacks)
+        if phase_callback is not None:
+            callbacks.append(phase_callback)
+        return callbacks if callbacks else None
 
     training_artifacts: Dict[str, Tuple[object, object]] = {}
     adam_history = model.train(
         iterations=adam_iters,
-        callbacks=callbacks if callbacks else None,
+        callbacks=_build_callbacks(adam_checkpoint),
     )
     if isinstance(adam_history, tuple) and len(adam_history) == 2:
         training_artifacts["adam"] = adam_history
 
     if TRAINING_CONFIG.get("use_lbfgs", True):
         model.compile("L-BFGS", loss_weights=loss_weights)
-        lbfgs_history = model.train(callbacks=callbacks if callbacks else None)
+        lbfgs_history = model.train(callbacks=_build_callbacks(lbfgs_checkpoint))
         if isinstance(lbfgs_history, tuple) and len(lbfgs_history) == 2:
             training_artifacts["lbfgs"] = lbfgs_history
 
@@ -2369,6 +2438,32 @@ def main():
         print(f"[force_estimation] Using explicit num_domain={effective_num_domain}.")
     else:
         print("[force_estimation] Domain sampling disabled (num_domain=0).")
+
+    effective_num_test: int | None = None
+    num_test_mode = "train_points"
+    raw_num_test = args.num_test
+    if raw_num_test is None:
+        num_test_mode = "train_points"
+    else:
+        requested_num_test = int(raw_num_test)
+        if requested_num_test < 0:
+            num_test_mode = "train_points"
+        elif requested_num_test == 0:
+            if effective_num_domain > 0:
+                effective_num_test = max(1, int(effective_num_domain))
+                num_test_mode = "match_domain"
+        else:
+            effective_num_test = max(1, int(requested_num_test))
+            num_test_mode = "explicit"
+
+    if effective_num_test is not None:
+        print(
+            "[force_estimation] Independent PDE test sampling enabled: "
+            f"num_test={effective_num_test} ({num_test_mode})."
+        )
+    else:
+        print("[force_estimation] Test loss shares training points (num_test disabled).")
+
     geom = build_geometry(
         anchors,
         df if use_mixed_geometry else None,
@@ -2453,6 +2548,7 @@ def main():
         bcs,
         num_domain=effective_num_domain,
         num_boundary=0,
+        num_test=effective_num_test,
         anchors=anchors,
         auxiliary_var_function=const_mgr.auxiliary,
     )
@@ -2528,6 +2624,11 @@ def main():
 
     dtype_name = np.dtype(dtype).name
     unit_meta = getattr(df, "attrs", {}).get("unit_meta", {})
+    num_test_summary = (
+        f"{effective_num_test} ({num_test_mode})"
+        if effective_num_test is not None
+        else "train_points"
+    )
     config_pairs = [
         ("dtype", dtype_name),
         ("adam_iters", TRAINING_CONFIG["adam_iterations"]),
@@ -2539,6 +2640,7 @@ def main():
             if effective_num_domain > 0
             else f"{effective_num_domain} ({domain_mode})",
         ),
+        ("num_test", num_test_summary),
         ("bc_batch", bc_batch if bc_batch is not None else "all"),
         ("resample_period", args.resample_period if args.resample_period > 0 else "disabled"),
         ("max_points", args.max_points or "full"),
@@ -2741,6 +2843,63 @@ def main():
         plot_paths = generate_residual_distribution_plots(residual_matrix, plot_dir_abs)
         for path in plot_paths:
             print(f"[force_estimation] 残差分布图已保存: {path}")
+
+    export_tasks: List[Tuple[str, str, Callable[[str], None]]] = []
+
+    torchscript_path = (args.export_torchscript or "").strip()
+    if torchscript_path:
+        export_tasks.append(
+            (
+                "TorchScript",
+                torchscript_path,
+                lambda path: export_torchscript_model(model, path, INPUT_DIM),
+            )
+        )
+
+    onnx_path = (args.export_onnx or "").strip()
+    if onnx_path:
+        export_tasks.append(
+            (
+                "ONNX",
+                onnx_path,
+                lambda path: export_onnx_model(model, path, INPUT_DIM),
+            )
+        )
+
+    metadata_path = (args.export_metadata or "").strip()
+    if metadata_path:
+        export_tasks.append(
+            (
+                "metadata",
+                metadata_path,
+                lambda path: export_model_metadata(
+                    path,
+                    feature_columns=FEATURE_COLUMNS,
+                    auxiliary_columns=AUXILIARY_COLUMNS,
+                    residual_components=RESIDUAL_COMPONENT_NAMES,
+                    network_config=NETWORK_CONFIG,
+                    input_dim=INPUT_DIM,
+                    output_dim=OUTPUT_DIM,
+                    dtype=dtype_name,
+                ),
+            )
+        )
+
+    normalizer_path = (args.export_normalizer or "").strip()
+    if normalizer_path:
+        export_tasks.append(
+            (
+                "normalizer",
+                normalizer_path,
+                lambda path: export_normalizer_to_json(normalizer, FEATURE_COLUMNS, path),
+            )
+        )
+
+    for label, target_path, fn in export_tasks:
+        try:
+            fn(target_path)
+        except Exception as exc:  # pragma: no cover - runtime/env dependent
+            print(f"[force_estimation] 导出 {label} 失败: {exc}")
 
 
 if __name__ == "__main__":
