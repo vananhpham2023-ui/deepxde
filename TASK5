@@ -328,6 +328,8 @@ force_estimation/
 └── force_estimation.py           # 改造版主程序
 ```
 
+> 若训练命令追加 `--single-checkpoint`，则在 run 结束后会自动清理由本次训练生成的多余权重文件，只保留最优 `.pt`（不会触碰旧 run 遗留的快照）。
+
 ------
 
 ## 七、预期改造效果

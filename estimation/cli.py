@@ -14,7 +14,7 @@ import glob
 import argparse
 import pickle
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Set, Tuple
 
 import deepxde as dde
 import numpy as np
@@ -225,6 +225,7 @@ TRAINING_CONFIG: Dict[str, object] = {
     "adam_lr": 1e-3,
     "use_lbfgs": True,
     "checkpoint_path": "checkpoints/force_estimation",
+    "checkpoint_keep_last": False,
 }
 
 MIXED_GEOMETRY_CONFIG: Dict[str, float] = {
@@ -913,6 +914,13 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
         {"type": float, "default": None, "help": "覆盖默认的 Adam 学习率。"},
     ),
     ("--disable-lbfgs", {"action": "store_true", "help": "禁用 L-BFGS 微调阶段。"}),
+    (
+        "--single-checkpoint",
+        {
+            "action": "store_true",
+            "help": "训练结束后仅保留本次 run 生成的最优 checkpoint，其余将被删除。",
+        },
+    ),
     ("--disable-mixed-geometry", {"action": "store_true", "help": "禁用混合几何采样，回退至高维 Hypercube。"}),
     (
         "--geometry-mix-ratio",
@@ -1034,6 +1042,65 @@ def save_training_phase_outputs(
         print(f"[force_estimation] 训练曲线已保存: {plot_path}")
         saved_plot = plot_path
     return saved_plot
+
+
+def _snapshot_checkpoint_files(prefix: str) -> Set[str]:
+    if not prefix:
+        return set()
+    return set(glob.glob(f"{prefix}-*"))
+
+
+def _extract_checkpoint_iteration(filename: str, base_name: str) -> int | None:
+    prefix = f"{base_name}-"
+    if not filename.startswith(prefix):
+        return None
+    idx = len(prefix)
+    digits = []
+    while idx < len(filename) and filename[idx].isdigit():
+        digits.append(filename[idx])
+        idx += 1
+    if not digits:
+        return None
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return None
+
+
+def _cleanup_checkpoint_files(prefix: str, *, existing_files: Set[str] | None = None) -> None:
+    if not prefix:
+        return
+    current = set(glob.glob(f"{prefix}-*"))
+    previous = existing_files or set()
+    new_files = current - previous
+    if not new_files:
+        return
+    base_name = os.path.basename(prefix)
+    grouped: Dict[int, List[str]] = {}
+    for path in new_files:
+        iteration = _extract_checkpoint_iteration(os.path.basename(path), base_name)
+        if iteration is None:
+            continue
+        grouped.setdefault(iteration, []).append(path)
+    if not grouped:
+        return
+    best_iter = max(grouped)
+    removed = 0
+    for iteration, paths in grouped.items():
+        if iteration == best_iter:
+            continue
+        for path in paths:
+            try:
+                os.remove(path)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                print(f"[force_estimation] 无法删除旧 checkpoint {path}: {exc}")
+    if removed:
+        print(
+            f"[force_estimation] checkpoint 清理完成，保留迭代 {best_iter}，移除 {removed} 个文件。"
+        )
 
 
 def _extract_group_samples(residual_matrix: np.ndarray) -> Dict[str, np.ndarray]:
@@ -2358,6 +2425,7 @@ def main():
         TRAINING_CONFIG["adam_lr"] = float(args.adam_lr)
     if args.disable_lbfgs:
         TRAINING_CONFIG["use_lbfgs"] = False
+    TRAINING_CONFIG["checkpoint_keep_last"] = bool(args.single_checkpoint)
 
     data_path = str(args.data)
     use_demo = bool(args.demo)
@@ -2772,6 +2840,12 @@ def main():
     ]
     _print_config(config_pairs)
 
+    checkpoint_path = str(TRAINING_CONFIG.get("checkpoint_path") or "")
+    cleanup_enabled = bool(TRAINING_CONFIG.get("checkpoint_keep_last")) and bool(checkpoint_path)
+    checkpoint_snapshot: Set[str] | None = None
+    if cleanup_enabled:
+        checkpoint_snapshot = _snapshot_checkpoint_files(checkpoint_path)
+
     model, training_artifacts = train_model(model, loss_weights, extra_callbacks=callbacks)
     if train_plot_dir:
         for phase, artifact in training_artifacts.items():
@@ -2785,6 +2859,9 @@ def main():
                 data_root=train_plot_dir,
                 plot_path=plot_path,
             )
+
+    if cleanup_enabled:
+        _cleanup_checkpoint_files(checkpoint_path, existing_files=checkpoint_snapshot)
 
     if demo_used:
         out_dir = os.getcwd()
