@@ -330,6 +330,18 @@ force_estimation/
 
 > 若训练命令追加 `--single-checkpoint`，则在 run 结束后会自动清理由本次训练生成的多余权重文件，只保留最优 `.pt`（不会触碰旧 run 遗留的快照）。
 
+### 额外：数据划分 & PDE 残差测试
+
+- 使用 `estimation/datasets/split_dataset.py` 可快速将 `clean_dataset_force_estimation.csv` 按 55%/20%/25% 拆成 `*_train.csv`、`*_val.csv`、`*_test.csv`。默认随机种子 42，运行示例：
+
+  ```bash
+  python3 estimation/datasets/split_dataset.py \
+      --input estimation/datasets/clean_dataset_force_estimation.csv \
+      --train-ratio 0.55 --val-ratio 0.20 --test-ratio 0.25 --seed 42
+  ```
+
+- 训练/验证时用 `--data` 指定相应 CSV；若要对 PDE 残差进行独立测试，训练命令中追加 `--num-test 0`（与 `num_domain` 相同）或指定显式数量 `--num-test 2048`，即可让 DeepXDE 在每个 epoch 额外采样 PDE 测试点并报告独立的 residual/test loss。
+
 ------
 
 ## 七、预期改造效果
