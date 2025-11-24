@@ -1,5 +1,15 @@
-estimation/datasets/*.csv
-logs/*.csv
-__pycache__/
-*.pyc
-bfg-*.jar
+# 忽略所有 CSV
+*.csv
+
+# 保留 TASK9 相关的训练数据
+!estimation/datasets/clean_dataset_task9.csv
+!estimation/datasets/force_estimation_task9_raw.csv
+!estimation/datasets/force_estimation_task9.csv
+
+# 忽略训练产生的大文件
+checkpoints/
+logs/
+exports/
+*.pt
+*.pkl
+*.dat
