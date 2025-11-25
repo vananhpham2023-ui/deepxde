@@ -7,9 +7,9 @@
 !estimation/datasets/force_estimation_task9.csv
 
 # 忽略训练产生的大文件
-checkpoints/
-logs/
-exports/
-*.pt
-*.pkl
-*.dat
+
+
+
+
+
+
