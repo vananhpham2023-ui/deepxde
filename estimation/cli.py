@@ -195,12 +195,23 @@ DEFAULT_RESIDUAL_METRICS_PATH = os.path.join("logs", "force_estimation_residual_
 DEFAULT_RESIDUAL_PLOT_DIR = os.path.join("logs", "residual_plots")
 DEFAULT_TRAIN_PLOT_DIR = os.path.join("logs")
 DEFAULT_TRAIN_PLOT_PREFIX = "train_plot"
+DEFAULT_PREDICTION_METRICS_PATH = os.path.join("logs", "prediction_metrics.csv")
+DEFAULT_METRICS_CSV = os.path.join("logs", "training_metrics.csv")
+DEFAULT_GRAD_MONITOR_LOG = os.path.join("logs", "gradient_norm.csv")
 
 # 可选观测列，用于 PointSetBC 监督（存在时自动启用）
 OBSERVATION_COLUMNS: Dict[str, Dict[str, List[str] | int]] = {
     "f_Q": {"cols": ["fQ_x", "fQ_y", "fQ_z"], "first_component": 0},
     "f_L": {"cols": ["fL_x", "fL_y", "fL_z"], "first_component": 3},
 }
+SUPERVISION_COMPONENT_NAMES: Tuple[str, ...] = (
+    "fQ_x",
+    "fQ_y",
+    "fQ_z",
+    "fL_x",
+    "fL_y",
+    "fL_z",
+)
 
 # 损失权重，r1/r2/r3 对应各自残差
 LOSS_WEIGHTS: Dict[str, float] = {
@@ -460,6 +471,37 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
     ("--demo", {"action": "store_true", "help": "启用演示数据（忽略 --data）"}),
     ("--float32", {"action": "store_true", "help": "使用 float32 精度训练（默认 float64）。"}),
     (
+        "--run-dir",
+        {
+            "type": str,
+            "default": None,
+            "help": "统一输出目录：若未显式指定各日志/图表路径，将写入该目录。",
+        },
+    ),
+    (
+        "--model-mode",
+        {
+            "type": str,
+            "choices": ["pinn", "fnn"],
+            "default": "pinn",
+            "help": "模型类型：pinn 使用物理残差训练；fnn 仅使用监督项（PointSetBC）。",
+        },
+    ),
+    ("--net-depth", {"type": int, "default": None, "help": "覆盖网络隐藏层数（默认 5）。"}),
+    ("--net-width", {"type": int, "default": None, "help": "覆盖网络每层宽度（默认 128）。"}),
+    (
+        "--net-activation",
+        {"type": str, "default": None, "help": "覆盖网络激活函数（如 tanh/relu/sin，默认 tanh）。"},
+    ),
+    (
+        "--net-initializer",
+        {
+            "type": str,
+            "default": None,
+            "help": "覆盖权重初始化方式（默认 Glorot uniform）。",
+        },
+    ),
+    (
         "--num-domain",
         {
             "type": int,
@@ -545,6 +587,14 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "type": str,
             "default": DEFAULT_RESIDUAL_METRICS_PATH,
             "help": "残差评估指标输出 CSV 路径（留空以禁用）。",
+        },
+    ),
+    (
+        "--prediction-metrics-path",
+        {
+            "type": str,
+            "default": DEFAULT_PREDICTION_METRICS_PATH,
+            "help": "预测精度指标（MAE/RMSE）输出 CSV 路径，或 'auto' 随 metrics-csv 前缀自动生成（留空以禁用）。",
         },
     ),
     (
@@ -735,7 +785,7 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
         "--grad-monitor-log",
         {
             "type": str,
-            "default": os.path.join("logs", "gradient_norm.csv"),
+            "default": DEFAULT_GRAD_MONITOR_LOG,
             "help": "梯度范数监控 CSV 输出路径。",
         },
     ),
@@ -767,7 +817,7 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
         "--metrics-csv",
         {
             "type": str,
-            "default": os.path.join("logs", "training_metrics.csv"),
+            "default": DEFAULT_METRICS_CSV,
             "help": "训练监控 CSV 输出路径（留空以禁用，Task 3.0）。",
         },
     ),
@@ -797,7 +847,33 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "help": "显式指定用于训练的随机子样本大小（<=数据量时生效，与 --seed 配合以保证可复现）。",
         },
     ),
-    ("--seed", {"type": int, "default": 42, "help": "控制数据采样与训练初始化的随机种子。"}),
+    (
+        "--time-focus-start",
+        {
+            "type": float,
+            "default": None,
+            "help": "可选：在构建数据集时，对 time >= 该秒数的观测样本进行过采样，以强化晚期阶段精度。",
+        },
+    ),
+    (
+        "--time-focus-end",
+        {
+            "type": float,
+            "default": None,
+            "help": "可选：仅对 [time-focus-start, time-focus-end] 区间内的样本执行过采样。",
+        },
+    ),
+    (
+        "--time-focus-multiplier",
+        {
+            "type": float,
+            "default": 1.0,
+            "help": "晚期时间段样本的过采样倍率（>1 时生效，例如 2.0 约等于将该时间段样本数量加倍）。",
+        },
+    ),
+    ("--seed", {"type": int, "default": 42, "help": "兼容入口：同时作用于数据采样与训练初始化的随机种子。"}),
+    ("--data-seed", {"type": int, "default": None, "help": "仅控制数据采样/缓存的一致性随机种子（默认等于 --seed）。"}),
+    ("--train-seed", {"type": int, "default": None, "help": "仅控制训练/初始化的随机种子（默认等于 --seed）。"}),
     ("--norm-cache", {"type": str, "default": "normalizer_stats.pkl", "help": "归一化统计缓存文件路径（Task 1.2 将启用）。"}),
     ("--dataset-cache", {"type": str, "default": None, "help": "数据集缓存文件路径，用于复用随机采样后的训练数据。"}),
     (
@@ -1170,6 +1246,16 @@ def _sanitize_positive(value: float, label: str) -> float:
     return val
 
 
+def _sanitize_positive_int(value: int, label: str) -> int:
+    try:
+        val = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} 必须为正整数，收到 {value}.")
+    if val <= 0:
+        raise ValueError(f"{label} 必须为正整数，收到 {value}.")
+    return val
+
+
 def resolve_loss_weight_dict(
     args,
     residual_scaler: ResidualScaler | None,
@@ -1258,6 +1344,37 @@ def _expand_cache_path(path: str | None) -> str | None:
     return path
 
 
+def _apply_run_dir_default(
+    path: str,
+    default_path: str,
+    run_dir: str,
+    *,
+    is_dir: bool = False,
+) -> str:
+    """If the path equals the default, rewrite it under run_dir; keep explicit empty."""
+    raw = (path or "").strip()
+    if not run_dir or raw == "":
+        return raw
+    normalized_default = os.path.abspath(default_path)
+    normalized_raw = os.path.abspath(raw)
+    if normalized_raw == normalized_default:
+        base = os.path.basename(default_path.rstrip(os.sep))
+        return os.path.join(run_dir, base)
+    return raw
+
+
+def _derive_prediction_metrics_path(metrics_csv: str) -> str:
+    if not metrics_csv:
+        return ""
+    abs_metrics = os.path.abspath(metrics_csv)
+    out_dir = os.path.dirname(abs_metrics)
+    base = os.path.splitext(os.path.basename(abs_metrics))[0]
+    if base.endswith("_metrics"):
+        base = base[: -len("_metrics")]
+    pred_base = f"{base}_pred_metrics.csv"
+    return os.path.join(out_dir, pred_base)
+
+
 def _read_pickle(path: str | None, label: str, fallback: str) -> Any:
     if not path or not os.path.exists(path):
         return None
@@ -1344,7 +1461,7 @@ def _load_dataset_cache_frame(
     cache_path: str | None,
     *,
     expected_meta: Dict[str, object],
-    seed: int | None,
+    data_seed: int | None,
 ) -> Tuple[pd.DataFrame, Dict[str, object]] | None:
     payload = _read_pickle(cache_path, "数据缓存", "将重新构建数据集。")
     if payload is None:
@@ -1364,10 +1481,26 @@ def _load_dataset_cache_frame(
             lambda cur, exp: _normalize_optional_int(cur) == exp,
             "max_points 不一致",
         ),
+        "data_seed": (
+            lambda cur, exp: _normalize_optional_int(cur) == _normalize_optional_int(exp),
+            "data_seed 不一致",
+        ),
         "use_demo": (lambda cur, exp: bool(cur) == bool(exp), "demo 模式不同"),
         "clip_range": (
             lambda cur, exp: (tuple(cur) if cur else None) == exp,
             "clip_range 不一致",
+        ),
+        "time_focus_start": (
+            lambda cur, exp: (cur is None and exp is None) or (cur is not None and exp is not None and float(cur) == float(exp)),
+            "time_focus_start 不一致",
+        ),
+        "time_focus_end": (
+            lambda cur, exp: (cur is None and exp is None) or (cur is not None and exp is not None and float(cur) == float(exp)),
+            "time_focus_end 不一致",
+        ),
+        "time_focus_multiplier": (
+            lambda cur, exp: float(cur) == float(exp),
+            "time_focus_multiplier 不一致",
         ),
         "unit_profile_arg": (
             lambda cur, exp: (cur or "auto") == exp,
@@ -1416,9 +1549,9 @@ def _load_dataset_cache_frame(
         if key in expected_meta and not cmp_fn(meta.get(key), expected_meta[key])
     ]
     if bool(meta.get("sampling_method")):
-        cached_seed = _normalize_optional_int(meta.get("seed"))
-        if cached_seed != _normalize_optional_int(seed):
-            mismatches.append("seed 不一致")
+        cached_seed = _normalize_optional_int(meta.get("data_seed", meta.get("seed")))
+        if cached_seed != _normalize_optional_int(data_seed):
+            mismatches.append("data_seed 不一致")
     if mismatches:
         print(
             "[force_estimation] 数据缓存元数据不匹配({})，将重新构建数据集。".format(
@@ -1779,6 +1912,96 @@ def _apply_sampling(
     return df, sampling_method
 
 
+def _apply_time_focus_oversampling(
+    df: pd.DataFrame,
+    time_focus_start: float | None,
+    time_focus_end: float | None,
+    multiplier: float,
+    seed: int | None,
+) -> Tuple[pd.DataFrame, Dict[str, object] | None]:
+    """Optional time-based oversampling to emphasize late-phase samples.
+
+    设计目标：
+    - 仅调整样本权重分布，不改变原始时间序列与物理量；
+    - 在指定时间段内复制部分样本，从而在训练损失中更关注该区间；
+    - 默认关闭（multiplier<=1 或未指定 start 时不生效）。
+    """
+    try:
+        if time_focus_start is None:
+            return df, None
+        start = float(time_focus_start)
+    except (TypeError, ValueError):
+        return df, None
+
+    try:
+        multiplier = float(multiplier)
+    except (TypeError, ValueError):
+        multiplier = 1.0
+
+    if multiplier <= 1.0 or "time" not in df.columns:
+        meta: Dict[str, object] = {
+            "time_focus_start": start,
+            "time_focus_end": time_focus_end,
+            "time_focus_multiplier": float(multiplier),
+        }
+        return df, meta
+
+    base = df.reset_index(drop=True)
+    times = base["time"].to_numpy(dtype=np.float64, copy=False)
+    mask = np.isfinite(times) & (times >= start)
+    if time_focus_end is not None and np.isfinite(time_focus_end):
+        mask &= times <= float(time_focus_end)
+    indices = np.nonzero(mask)[0]
+    if indices.size == 0:
+        print(
+            "[force_estimation] time-focus 过采样已请求，但在给定时间窗口内未找到样本，忽略该设置。"
+        )
+        meta = {
+            "time_focus_start": start,
+            "time_focus_end": time_focus_end,
+            "time_focus_multiplier": float(multiplier),
+            "time_focus_rows": 0,
+            "time_focus_aug_rows": 0,
+        }
+        return base, meta
+
+    focus_df = base.iloc[indices]
+    repeats = max(1, int(round(multiplier)))
+    if repeats <= 1:
+        meta = {
+            "time_focus_start": start,
+            "time_focus_end": time_focus_end,
+            "time_focus_multiplier": float(multiplier),
+            "time_focus_rows": int(indices.size),
+            "time_focus_aug_rows": 0,
+        }
+        return base, meta
+
+    extra_blocks = [focus_df] * (repeats - 1)
+    augmented = pd.concat([base] + extra_blocks, ignore_index=True)
+    effective_seed = seed if seed is not None else 42
+    augmented = augmented.sample(frac=1.0, random_state=effective_seed).reset_index(drop=True)
+    added = len(augmented) - len(base)
+    print(
+        "[force_estimation] 已对晚期时间段样本执行过采样: "
+        f"time >= {start:.2f}s"
+        + (
+            f", time <= {float(time_focus_end):.2f}s"
+            if time_focus_end is not None and np.isfinite(time_focus_end)
+            else ""
+        )
+        + f"，倍率≈{float(multiplier):.2f}，新增样本 {added} 条。"
+    )
+    meta = {
+        "time_focus_start": start,
+        "time_focus_end": time_focus_end,
+        "time_focus_multiplier": float(multiplier),
+        "time_focus_rows": int(indices.size),
+        "time_focus_aug_rows": int(added),
+    }
+    return augmented, meta
+
+
 def _format_metric(metric: object) -> str:
     if isinstance(metric, tuple):
         return f"min={metric[0]:.3f}, max={metric[1]:.3f}"
@@ -1973,7 +2196,10 @@ def load_dataset(
     use_demo: bool,
     max_points: int | None = None,
     sample_size: int | None = None,
-    seed: int | None = None,
+    time_focus_start: float | None = None,
+    time_focus_end: float | None = None,
+    time_focus_multiplier: float = 1.0,
+    data_seed: int | None = None,
     norm_cache: str | None = None,
     dataset_cache: str | None = None,
     clip_quantiles: Tuple[float, float] | None = DEFAULT_CLIP_QUANTILES,
@@ -2002,6 +2228,9 @@ def load_dataset(
         "use_demo": bool(use_demo_mode),
         "feature_columns": FEATURE_COLUMNS,
         "clip_range": clip_range,
+        "time_focus_start": float(time_focus_start) if time_focus_start is not None else None,
+        "time_focus_end": float(time_focus_end) if time_focus_end is not None else None,
+        "time_focus_multiplier": float(time_focus_multiplier),
         "unit_profile_arg": unit_profile,
         "pos_unit_arg": pos_unit,
         "vel_unit_arg": vel_unit,
@@ -2012,12 +2241,13 @@ def load_dataset(
         "thrust_from": thrust_from,
         "sqrt_kf_col": sqrt_kf_col,
         "motor_cmd_col": motor_cmd_col,
+        "data_seed": _normalize_optional_int(data_seed),
     }
     cached_meta: Dict[str, object] | None = None
     cache_result = _load_dataset_cache_frame(
         dataset_cache_path,
         expected_meta=expected_meta,
-        seed=seed,
+        data_seed=data_seed,
     )
     if cache_result is not None:
         df, cached_meta = cache_result
@@ -2191,19 +2421,31 @@ def load_dataset(
                 unit_conversion_meta.setdefault("fix_unit_vectors_applied", False)
 
         df, sampling_method = _apply_sampling(
-            df.reset_index(drop=True), sample_size, max_points, seed
+            df.reset_index(drop=True), sample_size, max_points, data_seed
         )
 
         if clip_range is not None:
-            df, _ = apply_quantile_clipping(df, CLIP_TARGET_COLUMNS, clip_range[0], clip_range[1])
+            df, _ = apply_quantile_clipping(
+                df, CLIP_TARGET_COLUMNS, clip_range[0], clip_range[1]
+            )
+
+        df, time_focus_meta = _apply_time_focus_oversampling(
+            df,
+            time_focus_start=time_focus_start,
+            time_focus_end=time_focus_end,
+            multiplier=time_focus_multiplier,
+            seed=data_seed,
+        )
 
         cache_meta = dict(expected_meta)
         cache_meta.update(
             {
-                "seed": _normalize_optional_int(seed),
+                "data_seed": _normalize_optional_int(data_seed),
                 "sampling_method": sampling_method,
             }
         )
+        if time_focus_meta:
+            cache_meta.update(time_focus_meta)
         if unit_conversion_meta:
             cache_meta.update(unit_conversion_meta)
         _save_dataset_cache_frame(
@@ -2243,6 +2485,26 @@ def _resolve_geometry_hparams(
     jitter = default_jitter if jitter_scale is None else float(jitter_scale)
     jitter = float(max(jitter, 0.0))
     return ratio, jitter
+
+
+def resolve_network_config(
+    base: Dict[str, int | str],
+    *,
+    depth_override: int | None,
+    width_override: int | None,
+    activation: str | None,
+    initializer: str | None,
+) -> Dict[str, int | str]:
+    config = dict(base)
+    if depth_override is not None:
+        config["depth"] = _sanitize_positive_int(depth_override, "--net-depth")
+    if width_override is not None:
+        config["width"] = _sanitize_positive_int(width_override, "--net-width")
+    if activation:
+        config["activation"] = str(activation)
+    if initializer:
+        config["initializer"] = str(initializer)
+    return config
 
 
 def resolve_effective_num_domain(
@@ -2312,11 +2574,12 @@ def build_geometry(
     return MixedGeometry(lower, upper, sampler=sampler)
 
 
-def build_network() -> dde.nn.FNN:
-    depth = int(NETWORK_CONFIG["depth"])
-    width = int(NETWORK_CONFIG["width"])
-    activation = str(NETWORK_CONFIG["activation"])
-    initializer = str(NETWORK_CONFIG["initializer"])
+def build_network(config: Dict[str, int | str] | None = None) -> dde.nn.FNN:
+    cfg = dict(NETWORK_CONFIG if config is None else config)
+    depth = _sanitize_positive_int(cfg.get("depth", NETWORK_CONFIG["depth"]), "网络 depth")
+    width = _sanitize_positive_int(cfg.get("width", NETWORK_CONFIG["width"]), "网络 width")
+    activation = str(cfg.get("activation", NETWORK_CONFIG["activation"]))
+    initializer = str(cfg.get("initializer", NETWORK_CONFIG["initializer"]))
     layer_sizes = [INPUT_DIM] + [width] * depth + [OUTPUT_DIM]
     return dde.nn.FNN(layer_sizes, activation, initializer)
 
@@ -2399,6 +2662,161 @@ def evaluate_model(
     return preds
 
 
+def compute_prediction_metrics(
+    df: pd.DataFrame,
+    preds: np.ndarray,
+    output_path: str,
+) -> pd.DataFrame | None:
+    truth_blocks: List[np.ndarray] = []
+    components: List[str] = []
+    for _, meta in OBSERVATION_COLUMNS.items():
+        cols: List[str] = meta["cols"]  # type: ignore[assignment]
+        if not set(cols).issubset(df.columns):
+            continue
+        truth_blocks.append(df[cols].to_numpy(dtype=np.float64, copy=False))
+        components.extend(cols)
+
+    if not truth_blocks or not components:
+        print("[force_estimation] 预测指标计算跳过：缺少 fQ/fL 真值列。")
+        return None
+
+    truth_matrix = np.concatenate(truth_blocks, axis=1)
+    pred_matrix = np.asarray(preds, dtype=np.float64)
+    n_cols = min(truth_matrix.shape[1], pred_matrix.shape[1])
+    if n_cols <= 0:
+        print("[force_estimation] 预测指标计算跳过：预测/真值维度为空。")
+        return None
+    if truth_matrix.shape[1] != pred_matrix.shape[1]:
+        print(
+            f"[force_estimation] 预测指标列数对齐: truth={truth_matrix.shape[1]} -> {n_cols}, "
+            f"pred={pred_matrix.shape[1]} -> {n_cols}"
+        )
+    truth_matrix = truth_matrix[:, :n_cols]
+    pred_matrix = pred_matrix[:, :n_cols]
+    components = components[:n_cols]
+
+    mask = np.isfinite(truth_matrix) & np.isfinite(pred_matrix)
+    diff = np.where(mask, pred_matrix - truth_matrix, np.nan)
+
+    def _scalar_stats(idx: int) -> Tuple[float, float, int, int]:
+        comp_mask = np.isfinite(diff[:, idx])
+        rows_count = int(np.count_nonzero(comp_mask))
+        if rows_count == 0:
+            return float("nan"), float("nan"), 0, 0
+        vals = diff[comp_mask, idx]
+        mae = float(np.mean(np.abs(vals)))
+        rmse = float(np.sqrt(np.mean(np.square(vals))))
+        return mae, rmse, rows_count, rows_count
+
+    def _group_stats(idxs: List[int], use_vector: bool = False) -> Tuple[float, float, int, int]:
+        if not idxs:
+            return float("nan"), float("nan"), 0, 0
+        row_mask = np.all(np.isfinite(diff[:, idxs]), axis=1)
+        rows_count = int(np.count_nonzero(row_mask))
+        if rows_count == 0:
+            return float("nan"), float("nan"), 0, 0
+        subset = diff[row_mask][:, idxs]
+        if use_vector:
+            norms = np.linalg.norm(subset, axis=1)
+            mae = float(np.mean(np.abs(norms)))
+            rmse = float(np.sqrt(np.mean(np.square(norms))))
+            values_count = rows_count * len(idxs)
+        else:
+            finite = subset[np.isfinite(subset)]
+            values_count = int(finite.size)
+            if values_count == 0:
+                return float("nan"), float("nan"), rows_count, 0
+            mae = float(np.mean(np.abs(finite)))
+            rmse = float(np.sqrt(np.mean(np.square(finite))))
+        return mae, rmse, rows_count, values_count
+
+    rows: List[Dict[str, object]] = []
+    for i, name in enumerate(components):
+        mae, rmse, count_rows, count_values = _scalar_stats(i)
+        rows.append(
+            {
+                "component": name,
+                "mae": mae,
+                "rmse": rmse,
+                "count_rows": count_rows,
+                "count_values": count_values,
+            }
+        )
+
+    group_indices: Dict[str, List[int]] = {}
+    for name, meta in OBSERVATION_COLUMNS.items():
+        cols: List[str] = meta["cols"]  # type: ignore[assignment]
+        idxs = [components.index(col) for col in cols if col in components]
+        if len(idxs) == len(cols):
+            group_indices[f"{name}_total"] = idxs
+
+    for label, idxs in group_indices.items():
+        mae, rmse, count_rows, count_values = _group_stats(idxs, use_vector=False)
+        rows.append(
+            {
+                "component": label,
+                "mae": mae,
+                "rmse": rmse,
+                "count_rows": count_rows,
+                "count_values": count_values,
+            }
+        )
+
+    # Vector L2 summaries
+    if "fQ_x" in components and "fQ_y" in components and "fQ_z" in components:
+        idxs_fq = [components.index(col) for col in ("fQ_x", "fQ_y", "fQ_z")]
+        mae, rmse, count_rows, count_values = _group_stats(idxs_fq, use_vector=True)
+        rows.append(
+            {
+                "component": "f_Q_vec_l2",
+                "mae": mae,
+                "rmse": rmse,
+                "count_rows": count_rows,
+                "count_values": count_values,
+            }
+        )
+    if "fL_x" in components and "fL_y" in components and "fL_z" in components:
+        idxs_fl = [components.index(col) for col in ("fL_x", "fL_y", "fL_z")]
+        mae, rmse, count_rows, count_values = _group_stats(idxs_fl, use_vector=True)
+        rows.append(
+            {
+                "component": "f_L_vec_l2",
+                "mae": mae,
+                "rmse": rmse,
+                "count_rows": count_rows,
+                "count_values": count_values,
+            }
+        )
+    overall_mae, overall_rmse, overall_rows, overall_values = _group_stats(
+        list(range(len(components))), use_vector=True
+    )
+    rows.append(
+        {
+            "component": "overall_vec_l2_6d",
+            "mae": overall_mae,
+            "rmse": overall_rmse,
+            "count_rows": overall_rows,
+            "count_values": overall_values,
+        }
+    )
+
+    metrics_df = pd.DataFrame(rows, columns=["component", "mae", "rmse", "count_rows", "count_values"])
+    out_abs = os.path.abspath(output_path)
+    out_dir = os.path.dirname(out_abs)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    metrics_df.to_csv(out_abs, index=False)
+    summary = ", ".join(
+        f"{row.component}: mae={row.mae:.3e}, rmse={row.rmse:.3e}"
+        for row in metrics_df.itertuples()
+        if np.isfinite(row.mae) and np.isfinite(row.rmse)
+    )
+    print(f"[force_estimation] 预测指标已保存: {out_abs}")
+    if summary:
+        print(f"[force_estimation] prediction metrics -> {summary}")
+    return metrics_df
+
+
 # --------------------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------------------
@@ -2413,11 +2831,42 @@ def main():
         sample_plot_specs = resolve_sample_plot_specs(args.sample_plot_specs)
     except ValueError as exc:
         raise SystemExit(f"[force_estimation] 采样可视化配置错误: {exc}") from exc
+    run_dir = (args.run_dir or "").strip()
+    if run_dir:
+        run_dir = os.path.abspath(run_dir)
+        os.makedirs(run_dir, exist_ok=True)
+    metrics_csv = (args.metrics_csv or "").strip()
+    grad_monitor_log = (args.grad_monitor_log or "").strip()
     residual_variance_target = (args.residual_variance_path or "").strip()
     residual_metrics_target = (args.residual_metrics_path or "").strip()
+    prediction_metrics_raw = (args.prediction_metrics_path or "").strip()
     residual_plot_dir = (args.residual_plot_dir or "").strip()
     train_plot_dir = (args.train_plot_dir or "").strip()
     train_plot_prefix = (args.train_plot_prefix or DEFAULT_TRAIN_PLOT_PREFIX).strip() or DEFAULT_TRAIN_PLOT_PREFIX
+    if run_dir:
+        metrics_csv = _apply_run_dir_default(metrics_csv, DEFAULT_METRICS_CSV, run_dir)
+        grad_monitor_log = _apply_run_dir_default(grad_monitor_log, DEFAULT_GRAD_MONITOR_LOG, run_dir)
+        residual_variance_target = _apply_run_dir_default(
+            residual_variance_target, DEFAULT_RESIDUAL_VARIANCE_PATH, run_dir
+        )
+        residual_metrics_target = _apply_run_dir_default(
+            residual_metrics_target, DEFAULT_RESIDUAL_METRICS_PATH, run_dir
+        )
+        prediction_metrics_raw = _apply_run_dir_default(
+            prediction_metrics_raw, DEFAULT_PREDICTION_METRICS_PATH, run_dir
+        )
+        residual_plot_dir = _apply_run_dir_default(residual_plot_dir, DEFAULT_RESIDUAL_PLOT_DIR, run_dir, is_dir=True)
+        train_plot_dir = _apply_run_dir_default(train_plot_dir, DEFAULT_TRAIN_PLOT_DIR, run_dir, is_dir=True)
+        if train_plot_prefix == DEFAULT_TRAIN_PLOT_PREFIX:
+            derived_prefix = os.path.splitext(os.path.basename(metrics_csv))[0] or DEFAULT_TRAIN_PLOT_PREFIX
+            train_plot_prefix = derived_prefix
+    prediction_metrics_target = (
+        _derive_prediction_metrics_path(metrics_csv)
+        if prediction_metrics_raw.lower() == "auto"
+        else prediction_metrics_raw
+    )
+    model_mode = (args.model_mode or "pinn").lower()
+    is_fnn_mode = model_mode == "fnn"
 
     if args.adam_iters is not None:
         TRAINING_CONFIG["adam_iterations"] = max(1, int(args.adam_iters))
@@ -2433,6 +2882,18 @@ def main():
         dde.config.set_default_float("float32")
 
     dtype = np.float32 if args.float32 else np.float64
+    base_seed = int(args.seed)
+    data_seed = base_seed if args.data_seed is None else int(args.data_seed)
+    train_seed = base_seed if args.train_seed is None else int(args.train_seed)
+    dde.config.set_random_seed(train_seed)
+    network_config = resolve_network_config(
+        NETWORK_CONFIG,
+        depth_override=args.net_depth,
+        width_override=args.net_width,
+        activation=args.net_activation,
+        initializer=args.net_initializer,
+    )
+    NETWORK_CONFIG.update(network_config)
 
     clip_quantiles = (
         tuple(float(v) for v in args.clip_quantiles)
@@ -2444,7 +2905,10 @@ def main():
         use_demo,
         max_points=args.max_points,
         sample_size=args.sample_size,
-        seed=args.seed,
+        time_focus_start=args.time_focus_start,
+        time_focus_end=args.time_focus_end,
+        time_focus_multiplier=args.time_focus_multiplier,
+        data_seed=data_seed,
         norm_cache=args.norm_cache,
         dataset_cache=args.dataset_cache,
         clip_quantiles=clip_quantiles,
@@ -2496,7 +2960,15 @@ def main():
         min_points=domain_min_points,
         max_points=domain_max_points,
     )
-    if domain_mode == "auto":
+    if is_fnn_mode:
+        effective_num_domain = 0
+        domain_mode = "fnn"
+
+    if is_fnn_mode:
+        print(
+            "[force_estimation] 模式=fnn：仅使用监督损失，PDE 残差与域内采样已禁用。"
+        )
+    elif domain_mode == "auto":
         print(
             "[force_estimation] Auto domain sampling enabled: "
             f"num_domain={effective_num_domain} (ratio={domain_ratio}, "
@@ -2510,33 +2982,36 @@ def main():
     effective_num_test: int | None = None
     num_test_mode = "train_points"
     raw_num_test = args.num_test
-    if raw_num_test is None:
-        num_test_mode = "train_points"
-    else:
-        requested_num_test = int(raw_num_test)
-        if requested_num_test < 0:
+    if not is_fnn_mode:
+        if raw_num_test is None:
             num_test_mode = "train_points"
-        elif requested_num_test == 0:
-            if effective_num_domain > 0:
-                effective_num_test = max(1, int(effective_num_domain))
-                num_test_mode = "match_domain"
         else:
-            effective_num_test = max(1, int(requested_num_test))
-            num_test_mode = "explicit"
+            requested_num_test = int(raw_num_test)
+            if requested_num_test < 0:
+                num_test_mode = "train_points"
+            elif requested_num_test == 0:
+                if effective_num_domain > 0:
+                    effective_num_test = max(1, int(effective_num_domain))
+                    num_test_mode = "match_domain"
+            else:
+                effective_num_test = max(1, int(requested_num_test))
+                num_test_mode = "explicit"
 
-    if effective_num_test is not None:
-        print(
-            "[force_estimation] Independent PDE test sampling enabled: "
-            f"num_test={effective_num_test} ({num_test_mode})."
-        )
+        if effective_num_test is not None:
+            print(
+                "[force_estimation] Independent PDE test sampling enabled: "
+                f"num_test={effective_num_test} ({num_test_mode})."
+            )
+        else:
+            print("[force_estimation] Test loss shares training points (num_test disabled).")
     else:
-        print("[force_estimation] Test loss shares training points (num_test disabled).")
+        num_test_mode = "disabled"
 
     geom = build_geometry(
         anchors,
         df if use_mixed_geometry else None,
         normalizer if use_mixed_geometry else None,
-        seed=args.seed,
+        seed=data_seed,
         mix_ratio=args.geometry_mix_ratio,
         jitter_scale=args.geometry_jitter_scale,
         enable_mixed=use_mixed_geometry,
@@ -2575,7 +3050,7 @@ def main():
         df,
         AUXILIARY_COLUMNS,
         anchors,
-        seed=args.seed,
+        seed=data_seed,
     )
 
     residual_scaler = build_residual_scaler(
@@ -2589,41 +3064,64 @@ def main():
     )
     if residual_scaler is None:
         print("[force_estimation] Residual normalization disabled.")
-    else:
+    elif not is_fnn_mode:
         print(
             "[force_estimation] Residual normalization enabled: "
             f"{residual_scaler.summary()}"
         )
+    else:
+        print(
+            "[force_estimation] FNN 模式下训练不使用残差归一化；仅用于后验诊断: "
+            f"{residual_scaler.summary()}"
+        )
 
-    loss_weight_dict = resolve_loss_weight_dict(args, residual_scaler)
     bc_loss_weight = resolve_bc_loss_weight(SUPERVISION_WEIGHT, args.bc_loss_weight)
-    pde_loss_weights = expand_pde_loss_weights(loss_weight_dict)
-    loss_weights = build_loss_weight_vector(len(bcs), pde_loss_weights, bc_loss_weight)
-    print(
-        "[force_estimation] Loss weights -> "
-        f"r1={loss_weight_dict['r1']:.3e}, "
-        f"r2={loss_weight_dict['r2']:.3e}, "
-        f"r3={loss_weight_dict['r3']:.3e}, "
-        f"bc={bc_loss_weight:.3e} "
-        f"(mode={args.loss_weight_mode})"
-    )
+    loss_weight_dict: Dict[str, float] | None = None
+    pde_loss_weights: List[float] = []
+    if is_fnn_mode:
+        loss_weights = [bc_loss_weight] * len(bcs)
+        print(
+            "[force_estimation] Loss weights (FNN) -> "
+            f"bc={bc_loss_weight:.3e} (components={len(bcs)})"
+        )
+        if args.adaptive_weights or args.loss_weight_mode != "manual" or args.num_domain > 0:
+            print(
+                "[force_estimation] FNN 模式下已忽略 PDE/自适应权重与 num_domain 设置，训练仅包含监督损失。"
+            )
+    else:
+        loss_weight_dict = resolve_loss_weight_dict(args, residual_scaler)
+        pde_loss_weights = expand_pde_loss_weights(loss_weight_dict)
+        loss_weights = build_loss_weight_vector(len(bcs), pde_loss_weights, bc_loss_weight)
+        print(
+            "[force_estimation] Loss weights -> "
+            f"r1={loss_weight_dict['r1']:.3e}, "
+            f"r2={loss_weight_dict['r2']:.3e}, "
+            f"r3={loss_weight_dict['r3']:.3e}, "
+            f"bc={bc_loss_weight:.3e} "
+            f"(mode={args.loss_weight_mode})"
+        )
 
-    residual = build_force_estimation_residual(normalizer, const_mgr, residual_scaler)
+    residual = None
+    if not is_fnn_mode:
+        residual = build_force_estimation_residual(normalizer, const_mgr, residual_scaler)
 
     data = dde.data.PDE(
         geom,
         residual,
         bcs,
-        num_domain=effective_num_domain,
+        num_domain=effective_num_domain if not is_fnn_mode else 0,
         num_boundary=0,
-        num_test=effective_num_test,
-        anchors=anchors,
-        auxiliary_var_function=const_mgr.auxiliary,
+        num_test=effective_num_test if not is_fnn_mode else None,
+        anchors=None if is_fnn_mode else anchors,
+        auxiliary_var_function=None if is_fnn_mode else const_mgr.auxiliary,
     )
 
-    net = build_network()
+    net = build_network(network_config)
     model = dde.Model(data, net)
 
+    metrics_component_names = (
+        SUPERVISION_COMPONENT_NAMES if is_fnn_mode else RESIDUAL_COMPONENT_NAMES
+    )
     callbacks: List[dde.callbacks.Callback] = []
     if args.resample_period > 0 and (effective_num_domain > 0 or bc_batch):
         callbacks.append(
@@ -2643,13 +3141,12 @@ def main():
         )
 
     # Task 3.0: 监控基础设施（MetricsLogger）
-    metrics_csv = (args.metrics_csv or "").strip()
     if metrics_csv:
         try:
             callbacks.append(
                 MetricsLogger(
                     csv_path=metrics_csv,
-                    component_names=RESIDUAL_COMPONENT_NAMES,
+                    component_names=metrics_component_names,
                     period=max(1, int(args.metrics_period)),
                     record_gradients=bool(args.metrics_gradients),
                 )
@@ -2661,7 +3158,7 @@ def main():
         try:
             callbacks.append(
                 GradientNormMonitor(
-                    log_path=args.grad_monitor_log,
+                    log_path=grad_monitor_log,
                     period=max(1, int(args.grad_monitor_period)),
                     min_norm=float(args.grad_norm_min),
                     max_norm=float(args.grad_norm_max),
@@ -2671,7 +3168,7 @@ def main():
         except Exception as exc:
             print(f"[force_estimation] 初始化 GradientNormMonitor 失败: {exc}")
 
-    if args.adaptive_weights:
+    if args.adaptive_weights and not is_fnn_mode:
         try:
             weight_min = _sanitize_positive(args.adaptive_weight_min, "--adaptive-weight-min")
             weight_max = _sanitize_positive(args.adaptive_weight_max, "--adaptive-weight-max")
@@ -2695,9 +3192,28 @@ def main():
     num_test_summary = (
         f"{effective_num_test} ({num_test_mode})"
         if effective_num_test is not None
-        else "train_points"
+        else ("train_points" if num_test_mode == "train_points" else num_test_mode)
+    )
+    network_summary = "depth={}, width={}, act={}, init={}".format(
+        network_config["depth"],
+        network_config["width"],
+        network_config["activation"],
+        network_config["initializer"],
+    )
+    loss_weight_summary = (
+        f"r1={loss_weight_dict['r1']:.3f}, r2={loss_weight_dict['r2']:.3f}, "
+        f"r3={loss_weight_dict['r3']:.3f}, bc={bc_loss_weight:.3f}"
+        if loss_weight_dict is not None
+        else f"bc={bc_loss_weight:.3f} (fnn)"
+    )
+    adaptive_summary = (
+        f"period={args.adaptive_weight_period}, alpha={args.adaptive_weight_alpha:.2f}"
+        if args.adaptive_weights and not is_fnn_mode
+        else ("disabled (fnn)" if args.adaptive_weights and is_fnn_mode else "disabled")
     )
     config_pairs = [
+        ("model_mode", model_mode),
+        ("network", network_summary),
         ("dtype", dtype_name),
         ("adam_iters", TRAINING_CONFIG["adam_iterations"]),
         ("adam_lr", TRAINING_CONFIG["adam_lr"]),
@@ -2713,7 +3229,9 @@ def main():
         ("resample_period", args.resample_period if args.resample_period > 0 else "disabled"),
         ("max_points", args.max_points or "full"),
         ("sample_size", args.sample_size or "full"),
-        ("seed", args.seed),
+        ("seed_compat", base_seed),
+        ("data_seed", data_seed),
+        ("train_seed", train_seed),
         ("norm_cache", args.norm_cache),
         ("dataset_cache", args.dataset_cache or "disabled"),
         (
@@ -2745,6 +3263,10 @@ def main():
             os.path.abspath(residual_plot_dir)
             if residual_plot_dir
             else "disabled",
+        ),
+        (
+            "prediction_metrics",
+            os.path.abspath(prediction_metrics_target) if prediction_metrics_target else "disabled",
         ),
         (
             "train_plots",
@@ -2813,18 +3335,11 @@ def main():
         ),
         (
             "loss_weights",
-            "r1={:.3f}, r2={:.3f}, r3={:.3f}, bc={:.3f}".format(
-                loss_weight_dict["r1"],
-                loss_weight_dict["r2"],
-                loss_weight_dict["r3"],
-                bc_loss_weight,
-            ),
+            loss_weight_summary,
         ),
         (
             "adaptive_weights",
-            f"period={args.adaptive_weight_period}, alpha={args.adaptive_weight_alpha:.2f}"
-            if args.adaptive_weights
-            else "disabled",
+            adaptive_summary,
         ),
         (
             "grad_monitor",
@@ -2870,6 +3385,12 @@ def main():
     else:
         out_dir = os.path.dirname(data_path) or os.getcwd()
     preds = evaluate_model(model, anchors, df, out_dir)
+
+    if prediction_metrics_target:
+        try:
+            compute_prediction_metrics(df, preds, prediction_metrics_target)
+        except Exception as exc:
+            print(f"[force_estimation] 预测指标计算失败: {exc}")
 
     need_residual_matrix = bool(
         residual_variance_target or residual_metrics_target or residual_plot_dir
