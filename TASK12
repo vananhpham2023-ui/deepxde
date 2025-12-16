@@ -78,7 +78,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   - 若用户传 `--train-seed`：只改变训练随机性，不影响数据抽样与 dataset_cache 命中
 
 **(D) 预测精度指标导出（否则“性能对比”缺乏核心指标）**
-- 新增：`--prediction-metrics-path PATH`（CSV，支持 `auto` 随 `--metrics-csv` 前缀生成 `<prefix>_pred_metrics.csv`）
+- 新增：`--prediction-metrics-path PATH`（CSV，支持 `auto` 随 `--metrics-csv` 前缀生成 `${prefix}_pred_metrics.csv`）
 - 行为：
   - 若数据中存在 `fQ_x/fQ_y/fQ_z/fL_x/fL_y/fL_z` 真值列：计算每分量 MAE/RMSE + 总体汇总并输出
   - 若不存在：打印提示并跳过（不报错）
@@ -86,14 +86,14 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 **(E)（可选，但强烈推荐）统一输出路径前缀，避免 sweep 覆盖文件**
 - 新增：`--run-dir DIR`
 - 行为：如果用户只给一个 `--run-dir logs/exp_xxx/`，则在未手动指定或仍使用默认值时自动生成：
-  - `--metrics-csv <run-dir>/training_metrics.csv`
-  - `--grad-monitor-log <run-dir>/gradient_norm.csv`
-  - `--residual-variance-path <run-dir>/residual_variance.csv`
-  - `--residual-metrics-path <run-dir>/force_estimation_residual_metrics.csv`
-  - `--residual-plot-dir <run-dir>/residual_plots/`
-  - `--train-plot-dir <run-dir>/logs/`
+  - `--metrics-csv ${run_dir}/training_metrics.csv`
+  - `--grad-monitor-log ${run_dir}/gradient_norm.csv`
+  - `--residual-variance-path ${run_dir}/residual_variance.csv`
+  - `--residual-metrics-path ${run_dir}/force_estimation_residual_metrics.csv`
+  - `--residual-plot-dir ${run_dir}/residual_plots/`
+  - `--train-plot-dir ${run_dir}/logs/`
   - `--train-plot-prefix` 由 metrics 文件名去掉扩展名派生（例如 training_metrics.csv → training_metrics）
-  - `--prediction-metrics-path <run-dir>/prediction_metrics.csv`（或配合 `--prediction-metrics-path auto` 用 metrics 前缀自动命名）
+  - `--prediction-metrics-path ${run_dir}/prediction_metrics.csv`（或配合 `--prediction-metrics-path auto` 用 metrics 前缀自动命名）
 > 若不想加该特性，也可以通过命令行手工给每次 run 不同的路径/前缀（见第 2 节命令）。
 
 **(F) 测试集显式配置**
@@ -163,14 +163,20 @@ DATA_ARGS="\
 --sample-size 10000 \
 --seed 42 \
 --data-seed 42 \
---norm-cache normalizer_stats.pkl \
+--norm-cache normalizer_stats_task12.pkl \
 --dataset-cache dataset_cache_task12.pkl \
 "
+
+# 梯度范数监控说明（重要）：
+# - 当前仓库使用的 DeepXDE 版本缺少 GradientNormMonitor 所需的接口，启用 --grad-monitor 往往只会生成空的
+#   gradient_norm.csv（仅表头、无数据行），不会影响训练但也不会产生有效梯度曲线。
+# - 因此本模板默认关闭梯度监控；若你已升级/修复相关接口，可把下面 GRAD_ARGS 取消注释启用。
+GRAD_ARGS=""
+# GRAD_ARGS="--grad-monitor --metrics-gradients"
 
 TRAIN_ARGS="\
 --adam-iters 10000 \
 --early-patience 0 \
---grad-monitor \
 "
 ```
 
@@ -187,6 +193,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp1_pinn \
   --metrics-csv logs/exp1_pinn/exp1_pinn_metrics.csv \
   --prediction-metrics-path auto \
@@ -208,13 +215,14 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp1_fnn \
   --metrics-csv logs/exp1_fnn/exp1_fnn_metrics.csv \
   --prediction-metrics-path auto \
   --model-mode fnn \
   --net-depth 5 --net-width 128 --net-activation tanh \
   --train-seed 42 \
-  --bc-loss-weight 1.0 \
+  --bc-loss-weight 1.0 \  
   --train-plot-prefix exp1_fnn
 ```
 
@@ -246,6 +254,7 @@ for depth_width in "3 64" "5 128" "8 256"; do
         --test-data estimation/datasets/force_estimation_test.csv \
         $DATA_ARGS \
         $TRAIN_ARGS \
+        $GRAD_ARGS \
         --run-dir "${run_dir}" \
         --metrics-csv "${run_dir}/${run_id}_metrics.csv" \
         --prediction-metrics-path auto \
@@ -276,6 +285,7 @@ for depth_width in "3 64" "5 128" "8 256"; do
         --test-data estimation/datasets/force_estimation_test.csv \
         $DATA_ARGS \
         $TRAIN_ARGS \
+        $GRAD_ARGS \
         --run-dir "${run_dir}" \
         --metrics-csv "${run_dir}/${run_id}_metrics.csv" \
         --prediction-metrics-path auto \
@@ -291,7 +301,7 @@ done
 
 汇总均值/方差建议：
 - 以 `*_pred_metrics.csv` 为主（输出力的 MAE/RMSE）
-- 辅助看 `<run-dir>/force_estimation_residual_metrics.csv` 与 `<run-dir>/residual_variance.csv`（物理一致性）
+- 辅助看 `${run_dir}/force_estimation_residual_metrics.csv` 与 `${run_dir}/residual_variance.csv`（物理一致性）
 > 若 sweep 规模较大且耗时过长：可在循环里额外加 `--disable-lbfgs` 先做 Adam-only 选型；最终候选再按实验 3 跑 Adam→L-BFGS 做最终对比。
 
 ### 2.3 实验 3：优化策略对比（Adam-only vs Adam→L-BFGS）
@@ -305,6 +315,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp3_adam_only \
   --metrics-csv logs/exp3_adam_only/exp3_adam_only_metrics.csv \
   --prediction-metrics-path auto \
@@ -327,6 +338,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp3_adam_lbfgs \
   --metrics-csv logs/exp3_adam_lbfgs/exp3_adam_lbfgs_metrics.csv \
   --prediction-metrics-path auto \
@@ -358,6 +370,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp4_adaptive \
   --metrics-csv logs/exp4_adaptive/exp4_adaptive_metrics.csv \
   --prediction-metrics-path auto \
@@ -372,10 +385,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --train-plot-prefix exp4_adaptive
 ```
 
-**(B-1) 固定权重（推荐）：把一次 inverse_residual 的静态权重“固化”为 manual**
-1) 先跑一遍“无 adaptive 的 inverse_residual”，记录启动时打印的：
-   `r1=..., r2=..., r3=..., bc=... (mode=inverse_residual)`
-2) 再用 manual 固化（示例中的数值用你实际打印替换）：
+**(B-1) 固定权重（manual，直接可跑）**
+下面这组 `r1/r2/r3` 数值来自默认配置（`seed=42,data-seed=42,sample-size=10000,residual-norm-mode median,loss-weight-mode inverse_residual`）启动时打印的初始权重；如你修改了数据处理/单位/残差归一化策略，可再参考 (B-2) 的打印值自行调整。
 
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
@@ -383,6 +394,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp4_fixed_manual \
   --metrics-csv logs/exp4_fixed_manual/exp4_fixed_manual_metrics.csv \
   --prediction-metrics-path auto \
@@ -392,7 +404,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --num-domain 4000 \
   --residual-norm-mode median \
   --loss-weight-mode manual \
-  --loss-weight-r1 <W_R1> --loss-weight-r2 <W_R2> --loss-weight-r3 <W_R3> \
+  --loss-weight-r1 0.1810133936559792 --loss-weight-r2 0.2707977091610223 --loss-weight-r3 2.5481888971829987 \
   --bc-loss-weight 1.0 \
   --train-plot-prefix exp4_fixed_manual
 ```
@@ -404,6 +416,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
+  $GRAD_ARGS \
   --run-dir logs/exp4_fixed_inverse \
   --metrics-csv logs/exp4_fixed_inverse/exp4_fixed_inverse_metrics.csv \
   --prediction-metrics-path auto \
@@ -413,6 +426,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --num-domain 4000 \
   --residual-norm-mode median \
   --loss-weight-mode inverse_residual \
+  --bc-loss-weight 1.0 \
   --train-plot-prefix exp4_fixed_inverse
 ```
 
@@ -421,10 +435,10 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 ## 3) 产出物与对比维度（跑完怎么写结论更可信）
 
 建议每个 run 至少保存：
-- `<run-dir>/*_pred_metrics.csv`：输出力的 MAE/RMSE（主指标；使用 `--prediction-metrics-path auto` 时与 `--metrics-csv` 同目录同前缀）
-- `<run-dir>/residual_variance.csv`、`<run-dir>/force_estimation_residual_metrics.csv`、`<run-dir>/residual_plots/`：物理一致性（解释“为什么 PINN 值得用”）
-- `<run-dir>/*_metrics.csv`：训练过程（是否稳定、是否出现梯度爆炸/权重塌缩；来自 `--metrics-csv`）
-- `<run-dir>/logs/<train_plot_prefix>_adam.png`（以及若启用 L-BFGS：`<train_plot_prefix>_lbfgs.png`）：收敛曲线（实验 3 必需）
+- `${run_dir}/*_pred_metrics.csv`：输出力的 MAE/RMSE（主指标；使用 `--prediction-metrics-path auto` 时与 `--metrics-csv` 同目录同前缀）
+- `${run_dir}/residual_variance.csv`、`${run_dir}/force_estimation_residual_metrics.csv`、`${run_dir}/residual_plots/`：物理一致性（解释“为什么 PINN 值得用”）
+- `${run_dir}/*_metrics.csv`：训练过程（是否稳定、是否出现梯度爆炸/权重塌缩；来自 `--metrics-csv`）
+- `${run_dir}/logs/${train_plot_prefix}_adam.png`（以及若启用 L-BFGS：`${train_plot_prefix}_lbfgs.png`）：收敛曲线（实验 3 必需）
 
 统计方式（针对实验 2 的 3 次重复）：
 - 对每个配置，分别对 `RMSE_total`（或每分量 RMSE）做 mean/std
@@ -448,11 +462,11 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 - `--residual-norm-mode` 默认 `median`；在 fnn 模式下仅用于后验残差诊断，不影响训练目标（代码会打印提示）。
 
 ### 4.3 指标与输出（满足对比实验产出）
-- **预测精度指标**：`--prediction-metrics-path PATH|auto|""` 已接入；`auto` 会根据 `--metrics-csv` 生成 `<prefix>_pred_metrics.csv`，支持向量 L2 汇总行与 `count_rows/count_values`。
+- **预测精度指标**：`--prediction-metrics-path PATH|auto|""` 已接入；`auto` 会根据 `--metrics-csv` 生成 `${prefix}_pred_metrics.csv`，支持向量 L2 汇总行与 `count_rows/count_values`。
 - **训练过程日志**：`--metrics-csv` + `MetricsLogger` 已接入；pinn/fnn 会切换不同的 component_names，避免列数不匹配。
-- **梯度监控**：`--grad-monitor` 写入 `--grad-monitor-log`（PyTorch 才生效，非 PyTorch 会返回 NaN）。
+- **梯度监控（当前状态）**：现实现依赖 DeepXDE 的内部接口计算梯度范数；在当前仓库所用版本下可能无法得到有效数值，表现为 `gradient_norm.csv` 只有表头。训练本身不受影响。
 - **残差诊断**：默认会输出残差方差/指标/分布图（除非将对应路径置空），可用于比较物理一致性。
-- **输出隔离**：`--run-dir` 会把“仍为默认值的输出路径”重写到 `<run-dir>/...`；显式传空字符串会保持禁用（避免被重写）。
+- **输出隔离**：`--run-dir` 会把“仍为默认值的输出路径”重写到 `${run_dir}/...`；显式传空字符串会保持禁用（避免被重写）。
 
 ### 4.4 已知限制/边界情况（需要注意）
 - **预测结果 CSV 覆盖**：`force_estimation_prediction*.csv` 仍会导出到数据目录/同级目录（与 `--run-dir` 无关）。使用 `--prediction-export both` 会生成 `force_estimation_prediction_train.csv` 与 `force_estimation_prediction_test.csv`，sweep 会覆盖；通常只用于调试。
