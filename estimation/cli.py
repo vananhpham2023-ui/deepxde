@@ -81,6 +81,7 @@ try:  # pragma: no cover
         ConstantManager,
         ensure_columns,
         apply_quantile_clipping,
+        apply_quantile_bounds,
         _expand_cache_path,
         _load_normalizer_cache,
         _save_normalizer_cache,
@@ -91,6 +92,7 @@ except ImportError:  # pragma: no cover
         ConstantManager,
         ensure_columns,
         apply_quantile_clipping,
+        apply_quantile_bounds,
         _expand_cache_path,
         _load_normalizer_cache,
         _save_normalizer_cache,
@@ -124,6 +126,9 @@ except ImportError:  # pragma: no cover
 # 数据文件路径（默认指向 examples/pinn_inverse/datasets/force_estimation_train.csv）
 DATA_PATH = os.path.join(
     os.path.dirname(__file__), "datasets", "force_estimation_train.csv"
+)
+TEST_DATA_PATH = os.path.join(
+    os.path.dirname(__file__), "datasets", "force_estimation_test.csv"
 )
 
 # 原始数据列（保持与 CSV 一致，37 维）
@@ -468,6 +473,20 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             ),
         },
     ),
+    (
+        "--test-data",
+        {
+            "type": str,
+            "default": lambda: os.environ.get(
+                "FORCE_ESTIMATION_TEST_DATA",
+                TEST_DATA_PATH if os.path.exists(TEST_DATA_PATH) else "",
+            ),
+            "help": (
+                "测试数据文件或目录路径（可选）。默认尝试 estimation/datasets/force_estimation_test.csv；"
+                "留空则仅使用训练数据。"
+            ),
+        },
+    ),
     ("--demo", {"action": "store_true", "help": "启用演示数据（忽略 --data）"}),
     ("--float32", {"action": "store_true", "help": "使用 float32 精度训练（默认 float64）。"}),
     (
@@ -595,6 +614,18 @@ CLI_ARGUMENT_SPECS: Tuple[Tuple[str, Dict[str, object]], ...] = (
             "type": str,
             "default": DEFAULT_PREDICTION_METRICS_PATH,
             "help": "预测精度指标（MAE/RMSE）输出 CSV 路径，或 'auto' 随 metrics-csv 前缀自动生成（留空以禁用）。",
+        },
+    ),
+    (
+        "--prediction-export",
+        {
+            "type": str,
+            "choices": ["eval", "both"],
+            "default": "eval",
+            "help": (
+                "预测结果 CSV 导出范围：eval=仅导出当前评估集（默认有测试集则为 test，否则为 train）；"
+                "both=同时导出 train 与 test 两份（若无测试集则仅导出 train）。"
+            ),
         },
     ),
     (
@@ -1067,17 +1098,62 @@ def _plot_loss_history_png(loss_history, output_path: str, title: str) -> None:
     out_dir = os.path.dirname(os.path.abspath(output_path))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    steps = np.asarray(getattr(loss_history, "steps", []), dtype=np.float64)
-    train_loss = _summarize_losses(getattr(loss_history, "loss_train", []))
-    test_loss = _summarize_losses(getattr(loss_history, "loss_test", []))
-    if steps.size == 0 or steps.size != train_loss.size:
-        steps = np.arange(train_loss.size, dtype=np.float64)
+
+    def _clean_series(values: np.ndarray, label: str) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if arr.size == 0:
+            return arr
+        finite_mask = np.isfinite(arr)
+        if not np.all(finite_mask):
+            arr = arr[finite_mask]
+            print(f"[force_estimation] {label} 包含非有限值，已在绘图时忽略。")
+        if arr.size == 0:
+            return arr
+        positive_mask = arr > 0
+        if not np.any(positive_mask):
+            eps = np.finfo(np.float64).tiny
+            print(
+                f"[force_estimation] {label} 为非正值，已用 {eps:.1e} 作绘图占位。"
+            )
+            return np.full(arr.shape, eps, dtype=np.float64)
+        if not np.all(positive_mask):
+            min_pos = float(np.min(arr[positive_mask]))
+            eps = max(min_pos * 1e-6, np.finfo(np.float64).tiny)
+            arr = np.where(arr > 0, arr, eps)
+            print(
+                f"[force_estimation] {label} 中存在非正值，已使用 {eps:.1e} 作为下限。"
+            )
+        return arr
+
+    raw_steps = np.asarray(getattr(loss_history, "steps", []), dtype=np.float64)
+    train_loss = _clean_series(_summarize_losses(getattr(loss_history, "loss_train", [])), "Train loss")
+    test_loss = _clean_series(_summarize_losses(getattr(loss_history, "loss_test", [])), "Test loss")
+    if train_loss.size == 0 and test_loss.size:
+        print("[force_estimation] Train loss 历史为空，绘图将以 Test loss 作为占位曲线。")
+        train_loss = test_loss.copy()
+    train_steps = (
+        raw_steps if raw_steps.size == train_loss.size and train_loss.size > 0 else np.arange(train_loss.size, dtype=np.float64)
+    )
+    test_steps = (
+        raw_steps if raw_steps.size == test_loss.size and test_loss.size > 0 else np.arange(test_loss.size, dtype=np.float64)
+    )
     fig, ax = plt.subplots(figsize=(6.0, 4.0))
     if train_loss.size:
-        ax.semilogy(steps[: train_loss.size], train_loss, label="Train loss")
+        ax.semilogy(
+            train_steps[: train_loss.size],
+            train_loss,
+            label="Train loss",
+            linestyle="-",
+            linewidth=1.6,
+        )
     if test_loss.size:
-        test_steps = steps if test_loss.size == steps.size else np.arange(test_loss.size, dtype=np.float64)
-        ax.semilogy(test_steps, test_loss, label="Test loss")
+        ax.semilogy(
+            test_steps,
+            test_loss,
+            label="Test loss",
+            linestyle="--",
+            linewidth=1.6,
+        )
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     if title:
@@ -2203,6 +2279,7 @@ def load_dataset(
     norm_cache: str | None = None,
     dataset_cache: str | None = None,
     clip_quantiles: Tuple[float, float] | None = DEFAULT_CLIP_QUANTILES,
+    clip_stats: Dict[str, Tuple[float, float]] | None = None,
     unit_profile: str = "auto",
     pos_unit: str = "auto",
     vel_unit: str = "auto",
@@ -2214,6 +2291,7 @@ def load_dataset(
     sqrt_kf_col: str | None = "sqrt_kf",
     motor_cmd_col: str | None = None,
     dtype: np.dtype = np.float64,
+    normalizer: Normalizer | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray, Normalizer]:
     dtype = np.dtype(dtype)
     norm_cache_path = _expand_cache_path(norm_cache)
@@ -2221,6 +2299,7 @@ def load_dataset(
     use_demo_mode = use_demo or not os.path.exists(path)
     data_signature = _describe_data_source(path, use_demo_mode)
     clip_range = tuple(clip_quantiles) if clip_quantiles else None
+    clip_stats = clip_stats or None
     expected_meta = {
         "data_source": data_signature,
         "sample_size": _normalize_optional_int(sample_size),
@@ -2425,9 +2504,15 @@ def load_dataset(
         )
 
         if clip_range is not None:
-            df, _ = apply_quantile_clipping(
-                df, CLIP_TARGET_COLUMNS, clip_range[0], clip_range[1]
-            )
+            if clip_stats:
+                df = apply_quantile_bounds(df, clip_stats)
+                stats = clip_stats
+            else:
+                df, stats = apply_quantile_clipping(
+                    df, CLIP_TARGET_COLUMNS, clip_range[0], clip_range[1]
+                )
+            if stats:
+                df.attrs["clip_stats"] = stats
 
         df, time_focus_meta = _apply_time_focus_oversampling(
             df,
@@ -2467,12 +2552,106 @@ def load_dataset(
         if unit_meta_filtered:
             df.attrs["unit_meta"] = unit_meta_filtered
     features = df[FEATURE_COLUMNS].to_numpy(dtype=dtype)
-    normalizer = _load_normalizer_cache(norm_cache_path, dtype)
-    if normalizer is None:
-        normalizer = Normalizer.from_array(features)
-        _save_normalizer_cache(norm_cache_path, normalizer)
-    features_norm = normalizer.transform(features)
-    return df, features_norm, normalizer
+    normalizer_obj = normalizer or _load_normalizer_cache(norm_cache_path, dtype)
+    if normalizer_obj is None:
+        normalizer_obj = Normalizer.from_array(features)
+        _save_normalizer_cache(norm_cache_path, normalizer_obj)
+    features_norm = normalizer_obj.transform(features).astype(dtype, copy=False)
+    return df, features_norm, normalizer_obj
+
+
+def load_train_and_test_datasets(
+    train_path: str,
+    test_path: str | None,
+    use_demo: bool,
+    *,
+    max_points: int | None,
+    sample_size: int | None,
+    time_focus_start: float | None,
+    time_focus_end: float | None,
+    time_focus_multiplier: float,
+    data_seed: int | None,
+    norm_cache: str | None,
+    dataset_cache: str | None,
+    clip_quantiles: Tuple[float, float] | None,
+    unit_profile: str,
+    pos_unit: str,
+    vel_unit: str,
+    acc_unit: str,
+    fix_unit_vectors: bool,
+    recompute_rho: bool,
+    thrust_unit: str,
+    thrust_from: str,
+    sqrt_kf_col: str | None,
+    motor_cmd_col: str | None,
+    dtype: np.dtype,
+) -> Tuple[pd.DataFrame, np.ndarray, Normalizer, pd.DataFrame | None, np.ndarray | None]:
+    train_df, train_features_norm, normalizer = load_dataset(
+        train_path,
+        use_demo,
+        max_points=max_points,
+        sample_size=sample_size,
+        time_focus_start=time_focus_start,
+        time_focus_end=time_focus_end,
+        time_focus_multiplier=time_focus_multiplier,
+        data_seed=data_seed,
+        norm_cache=norm_cache,
+        dataset_cache=dataset_cache,
+        clip_quantiles=clip_quantiles,
+        unit_profile=unit_profile,
+        pos_unit=pos_unit,
+        vel_unit=vel_unit,
+        acc_unit=acc_unit,
+        fix_unit_vectors=fix_unit_vectors,
+        recompute_rho=recompute_rho,
+        thrust_unit=thrust_unit,
+        thrust_from=thrust_from,
+        sqrt_kf_col=sqrt_kf_col,
+        motor_cmd_col=motor_cmd_col,
+        dtype=dtype,
+    )
+    train_unit_meta = (train_df.attrs.get("unit_meta") or {}) if hasattr(train_df, "attrs") else {}
+    unit_profile_selected = train_unit_meta.get("unit_profile_selected", unit_profile)
+    pos_unit_selected = train_unit_meta.get("pos_unit_selected", pos_unit)
+    vel_unit_selected = train_unit_meta.get("vel_unit_selected", vel_unit)
+    acc_unit_selected = train_unit_meta.get("acc_unit_selected", acc_unit)
+    thrust_unit_selected = train_unit_meta.get("thrust_unit_selected", thrust_unit)
+    thrust_source_selected = train_unit_meta.get("thrust_source", thrust_from)
+    test_df: pd.DataFrame | None = None
+    test_features_norm: np.ndarray | None = None
+    if test_path:
+        try:
+            test_df, test_features_norm, _ = load_dataset(
+                test_path,
+                False,
+                max_points=max_points,
+                sample_size=sample_size,
+                time_focus_start=time_focus_start,
+                time_focus_end=time_focus_end,
+                time_focus_multiplier=time_focus_multiplier,
+                data_seed=data_seed,
+                norm_cache=None,
+                dataset_cache=None,
+                clip_quantiles=clip_quantiles,
+                clip_stats=train_df.attrs.get("clip_stats"),
+                unit_profile=unit_profile_selected,
+                pos_unit=pos_unit_selected,
+                vel_unit=vel_unit_selected,
+                acc_unit=acc_unit_selected,
+                fix_unit_vectors=fix_unit_vectors,
+                recompute_rho=recompute_rho,
+                thrust_unit=thrust_unit_selected,
+                thrust_from=thrust_source_selected,
+                sqrt_kf_col=sqrt_kf_col,
+                motor_cmd_col=motor_cmd_col,
+                dtype=dtype,
+                normalizer=normalizer,
+            )
+        except FileNotFoundError as exc:
+            print(f"[force_estimation] 测试集未找到 ({test_path})，将跳过：{exc}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[force_estimation] 测试集加载失败 ({test_path})：{exc}")
+    return train_df, train_features_norm, normalizer, test_df, test_features_norm
 
 
 def _resolve_geometry_hparams(
@@ -2637,11 +2816,17 @@ def train_model(
 
 
 def evaluate_model(
-    model: dde.Model, anchors: np.ndarray, df: pd.DataFrame, out_dir: str
+    model: dde.Model,
+    anchors: np.ndarray,
+    df: pd.DataFrame,
+    out_dir: str,
+    *,
+    tag: str | None = None,
 ) -> np.ndarray:
     preds = model.predict(anchors)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "force_estimation_prediction.csv")
+    tag_suffix = f"_{tag}" if tag else ""
+    out_path = os.path.join(out_dir, f"force_estimation_prediction{tag_suffix}.csv")
     pred_columns = [
         "fQ_hat_x",
         "fQ_hat_y",
@@ -2877,7 +3062,10 @@ def main():
     TRAINING_CONFIG["checkpoint_keep_last"] = bool(args.single_checkpoint)
 
     data_path = str(args.data)
+    test_data_path = (args.test_data or "").strip()
     use_demo = bool(args.demo)
+    if use_demo:
+        test_data_path = ""
     if args.float32:
         dde.config.set_default_float("float32")
 
@@ -2900,8 +3088,15 @@ def main():
         if args.clip_quantiles and not args.skip_clip
         else None
     )
-    df, features_norm, normalizer = load_dataset(
+    (
+        df,
+        features_norm,
+        normalizer,
+        df_test,
+        features_norm_test,
+    ) = load_train_and_test_datasets(
         data_path,
+        test_data_path or None,
         use_demo,
         max_points=args.max_points,
         sample_size=args.sample_size,
@@ -2933,6 +3128,14 @@ def main():
     demo_used = use_demo or not os.path.exists(data_path)
 
     anchors = features_norm.astype(dtype, copy=False)
+    eval_df = df
+    eval_anchors = anchors
+    eval_label = "train"
+    if df_test is not None and features_norm_test is not None:
+        eval_df = df_test
+        eval_anchors = features_norm_test.astype(dtype, copy=False)
+        eval_label = "test"
+        print(f"[force_estimation] 已加载测试集用于评估: {test_data_path}")
     resolved_mix_ratio, resolved_jitter = _resolve_geometry_hparams(
         args.geometry_mix_ratio, args.geometry_jitter_scale
     )
@@ -3003,7 +3206,10 @@ def main():
                 f"num_test={effective_num_test} ({num_test_mode})."
             )
         else:
-            print("[force_estimation] Test loss shares training points (num_test disabled).")
+            if df_test is not None and features_norm_test is not None and features_norm_test.size > 0:
+                print("[force_estimation] num_test 已禁用，将使用提供的测试集计算 Test loss。")
+            else:
+                print("[force_estimation] Test loss shares training points (num_test disabled).")
     else:
         num_test_mode = "disabled"
 
@@ -3115,6 +3321,76 @@ def main():
         anchors=None if is_fnn_mode else anchors,
         auxiliary_var_function=None if is_fnn_mode else const_mgr.auxiliary,
     )
+
+    if df_test is not None and features_norm_test is not None and features_norm_test.size > 0:
+        if not is_fnn_mode:
+            bc_points = (
+                data.train_x_bc
+                if data.train_x_bc is not None
+                else np.empty((0, anchors.shape[1]), dtype=dtype)
+            )
+            test_body = features_norm_test.astype(dtype, copy=False)
+            test_x = np.vstack((bc_points, test_body)) if bc_points.size else test_body
+            test_aux = None
+            if data.auxiliary_var_fn is not None:
+                test_aux = data.auxiliary_var_fn(test_x).astype(dtype, copy=False)
+            data.test_x = test_x
+            data.test_y = None
+            data.test_aux_vars = test_aux
+            effective_num_test = len(test_body)
+            num_test_mode = "dataset"
+            print(f"[force_estimation] Test loss 将使用提供的测试集，共 {len(test_body)} 个样本。")
+        else:
+            target_cols = list(SUPERVISION_COMPONENT_NAMES)
+            missing = [col for col in target_cols if col not in df_test.columns]
+            if missing:
+                print(
+                    "[force_estimation] FNN 模式测试集 loss 设置跳过：测试集缺少真值列 "
+                    f"{missing}，Test loss 将与 Train loss 重合。"
+                )
+            else:
+                test_targets = df_test[target_cols].to_numpy(dtype=dtype, copy=False)
+                test_x = features_norm_test.astype(dtype, copy=False)
+                data.test_x = test_x
+                data.test_y = test_targets
+                data.test_aux_vars = None
+                effective_num_test = len(test_targets)
+                num_test_mode = "dataset"
+                base_losses_test = data.losses_test
+                bcs_for_loss = list(bcs)
+
+                def _fnn_losses_test(targets, outputs, loss_fn, inputs, model, aux=None):
+                    if targets is None:
+                        return base_losses_test(targets, outputs, loss_fn, inputs, model, aux=aux)
+                    if not bcs_for_loss:
+                        return []
+                    loss_fns = loss_fn
+                    if not isinstance(loss_fns, (list, tuple)):
+                        loss_fns = [loss_fns] * len(bcs_for_loss)
+                    elif len(loss_fns) == 1:
+                        loss_fns = list(loss_fns) * len(bcs_for_loss)
+                    elif len(loss_fns) != len(bcs_for_loss):
+                        raise ValueError(
+                            f"FNN test loss: loss_fn 数量不匹配 (loss_fn={len(loss_fns)}, bcs={len(bcs_for_loss)})"
+                        )
+                    losses = []
+                    for i, bc in enumerate(bcs_for_loss):
+                        comp = getattr(bc, "component", None)
+                        if not isinstance(comp, (int, np.integer)):
+                            raise ValueError(
+                                f"FNN test loss: 不支持的 BC component 类型: {type(comp)}"
+                            )
+                        idx = int(comp)
+                        pred = outputs[:, idx : idx + 1]
+                        truth = targets[:, idx : idx + 1]
+                        error = pred - truth
+                        losses.append(loss_fns[i](bkd.zeros_like(error), error))
+                    return losses
+
+                data.losses_test = _fnn_losses_test
+                print(
+                    f"[force_estimation] FNN Test loss 将使用提供的测试集，共 {len(test_targets)} 个样本。"
+                )
 
     net = build_network(network_config)
     model = dde.Model(data, net)
@@ -3232,6 +3508,8 @@ def main():
         ("seed_compat", base_seed),
         ("data_seed", data_seed),
         ("train_seed", train_seed),
+        ("train_data", data_path),
+        ("test_data", test_data_path or "disabled"),
         ("norm_cache", args.norm_cache),
         ("dataset_cache", args.dataset_cache or "disabled"),
         (
@@ -3378,17 +3656,46 @@ def main():
     if cleanup_enabled:
         _cleanup_checkpoint_files(checkpoint_path, existing_files=checkpoint_snapshot)
 
+    eval_base_path = (
+        test_data_path if eval_label == "test" and test_data_path else data_path
+    )
     if demo_used:
         out_dir = os.getcwd()
-    elif os.path.isdir(data_path):
-        out_dir = data_path
+    elif os.path.isdir(eval_base_path):
+        out_dir = eval_base_path
     else:
-        out_dir = os.path.dirname(data_path) or os.getcwd()
-    preds = evaluate_model(model, anchors, df, out_dir)
+        out_dir = os.path.dirname(eval_base_path) or os.getcwd()
+    prediction_export = (args.prediction_export or "eval").strip().lower()
+    preds_train: np.ndarray | None = None
+    preds_test: np.ndarray | None = None
+    preds: np.ndarray | None = None
+    if prediction_export == "both":
+        try:
+            preds_train = evaluate_model(model, anchors, df, out_dir, tag="train")
+        except Exception as exc:
+            print(f"[force_estimation] 训练集预测导出失败: {exc}")
+        if eval_label == "test":
+            try:
+                preds_test = evaluate_model(model, eval_anchors, eval_df, out_dir, tag="test")
+            except Exception as exc:
+                print(f"[force_estimation] 测试集预测导出失败: {exc}")
+            preds = preds_test if preds_test is not None else preds_train
+        else:
+            preds = preds_train
+    else:
+        preds = evaluate_model(
+            model,
+            eval_anchors,
+            eval_df,
+            out_dir,
+            tag=eval_label if eval_label != "train" else None,
+        )
+    if preds is None:
+        raise RuntimeError("预测失败：未生成任何预测结果。")
 
     if prediction_metrics_target:
         try:
-            compute_prediction_metrics(df, preds, prediction_metrics_target)
+            compute_prediction_metrics(eval_df, preds, prediction_metrics_target)
         except Exception as exc:
             print(f"[force_estimation] 预测指标计算失败: {exc}")
 
@@ -3398,14 +3705,14 @@ def main():
     residual_matrix = None
     if need_residual_matrix:
         residual_matrix = compute_residual_components_numpy(
-            df,
+            eval_df,
             preds,
             residual_scaler=residual_scaler,
         )
 
     if residual_variance_target:
         residual_table = compute_residual_variance_table(
-            df,
+            eval_df,
             preds,
             residual_scaler=residual_scaler,
             residual_matrix=residual_matrix,
@@ -3424,7 +3731,7 @@ def main():
 
     if residual_metrics_target:
         metrics_table = compute_residual_metrics_numpy(
-            df,
+            eval_df,
             preds,
             residual_scaler=residual_scaler,
             residual_matrix=residual_matrix,

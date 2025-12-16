@@ -11,6 +11,8 @@
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
+  --prediction-export both \
   --seed 42 \
   --sample-size 10000 \
   --adam-iters 10000 \
@@ -41,6 +43,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 此外，为了“每个模型训练 3 次取均值/方差”可信，还需要：
 
 3) **拆分数据随机性与训练随机性**：当前 `--seed` 同时影响数据抽样（`--sample-size`）和训练初始化。若你用不同 seed 重复 3 次，会把“数据不同”的方差混进来，导致结论不干净。
+4) **显式指定测试集**：若未提供可用的测试集（`--test-data` 留空/默认未检测到 `force_estimation_test.csv`，或测试集缺少 `fQ_*/fL_*` 真值列），Test loss 会与 Train loss 重合（默认测试点与训练点相同）。建议在命令中显式给出 `--test-data estimation/datasets/force_estimation_test.csv`，以确保训练曲线与指标基于独立测试集。
 
 ---
 
@@ -93,6 +96,10 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
   - `--prediction-metrics-path <run-dir>/prediction_metrics.csv`（或配合 `--prediction-metrics-path auto` 用 metrics 前缀自动命名）
 > 若不想加该特性，也可以通过命令行手工给每次 run 不同的路径/前缀（见第 2 节命令）。
 
+**(F) 测试集显式配置**
+- 新增：`--test-data PATH`（默认尝试 `estimation/datasets/force_estimation_test.csv`，为空则复用训练点）
+- 行为：提供测试集且包含 `fQ_*/fL_*` 真值列时，PINN/FNN 的 Test loss 与训练后评估均基于该测试集；未提供测试集（或测试集缺少真值列）时 Test loss 与 Train loss 重合。
+
 ### 1.2 在 `estimation/cli.py` 的训练数据构建处加分支
 
 目标：两种模型网络结构完全一致，**唯一差异是训练损失中是否包含物理残差项**。
@@ -141,14 +148,18 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 2) **隔离输出目录**：每个 run 必须给唯一的 `--run-dir`，并配合 `--prediction-metrics-path auto`，避免 sweep 覆盖。
 
 > 额外提醒（当前代码行为，与 `--run-dir` 无关）：
-> - `force_estimation_prediction.csv` 会导出到数据所在目录/文件同级目录，sweep 会互相覆盖；通常只用于调试，可忽略该文件。
+> - `force_estimation_prediction*.csv` 会导出到数据所在目录/文件同级目录（与 `--run-dir` 无关）。本任务模板已加 `--prediction-export both`，因此会同时生成：
+>   - `force_estimation_prediction_train.csv`
+>   - `force_estimation_prediction_test.csv`（需提供测试集）
+>   sweep 会互相覆盖，通常只用于调试，可忽略该文件。
 > - checkpoint 前缀固定为 `checkpoints/force_estimation`，多次 run 会累积/覆盖；如需减少垃圾文件可加 `--single-checkpoint`（仅清理“本次 run 新产生的多余 checkpoint”）。
 
 为避免重复输入，先定义 2 个“公共参数块”（可直接复制执行）：
 
 ```bash
+# 注意：每条命令模板已显式包含 --data/--test-data，因此 DATA_ARGS 不再包含这两项。
 DATA_ARGS="\
---data estimation/datasets/force_estimation_train.csv \
+--prediction-export both \
 --sample-size 10000 \
 --seed 42 \
 --data-seed 42 \
@@ -172,6 +183,8 @@ TRAIN_ARGS="\
 **(A) PINN（baseline 等价）**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp1_pinn \
@@ -191,6 +204,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 **(B) 纯 FNN（无物理损失）**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp1_fnn \
@@ -227,6 +242,8 @@ for depth_width in "3 64" "5 128" "8 256"; do
       run_id="pinn_d${depth}_w${width}_act${act}_rep${rep}"
       run_dir="logs/sweep/${run_id}"
       DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+        --data estimation/datasets/force_estimation_train.csv \
+        --test-data estimation/datasets/force_estimation_test.csv \
         $DATA_ARGS \
         $TRAIN_ARGS \
         --run-dir "${run_dir}" \
@@ -255,6 +272,8 @@ for depth_width in "3 64" "5 128" "8 256"; do
       run_id="fnn_d${depth}_w${width}_act${act}_rep${rep}"
       run_dir="logs/sweep/${run_id}"
       DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+        --data estimation/datasets/force_estimation_train.csv \
+        --test-data estimation/datasets/force_estimation_test.csv \
         $DATA_ARGS \
         $TRAIN_ARGS \
         --run-dir "${run_dir}" \
@@ -282,6 +301,8 @@ done
 **(A) Adam-only**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp3_adam_only \
@@ -302,6 +323,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 **(B) Adam→L-BFGS（两阶段）**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp3_adam_lbfgs \
@@ -331,6 +354,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 **(A) 自适应加权（保持现状）**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp4_adaptive \
@@ -354,6 +379,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp4_fixed_manual \
@@ -373,6 +400,8 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 **(B-2) 固定权重（可接受）：禁用 adaptive，仅用 inverse_residual 作为“静态权重基线”**
 ```bash
 DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
+  --data estimation/datasets/force_estimation_train.csv \
+  --test-data estimation/datasets/force_estimation_test.csv \
   $DATA_ARGS \
   $TRAIN_ARGS \
   --run-dir logs/exp4_fixed_inverse \
@@ -426,7 +455,7 @@ DDE_BACKEND=pytorch python3 estimation/force_estimation.py \
 - **输出隔离**：`--run-dir` 会把“仍为默认值的输出路径”重写到 `<run-dir>/...`；显式传空字符串会保持禁用（避免被重写）。
 
 ### 4.4 已知限制/边界情况（需要注意）
-- **预测结果 CSV 覆盖**：`force_estimation_prediction.csv` 仍会导出到数据目录/同级目录（与 `--run-dir` 无关），sweep 会覆盖；通常只用于调试。
+- **预测结果 CSV 覆盖**：`force_estimation_prediction*.csv` 仍会导出到数据目录/同级目录（与 `--run-dir` 无关）。使用 `--prediction-export both` 会生成 `force_estimation_prediction_train.csv` 与 `force_estimation_prediction_test.csv`，sweep 会覆盖；通常只用于调试。
 - **checkpoint 非 run-dir 隔离**：checkpoint 前缀固定为 `checkpoints/force_estimation`；多次 run 会累积/覆盖，建议 sweep 时加 `--single-checkpoint` 或后续补充 `--checkpoint-path/--disable-checkpoint` CLI。
 - **auto 依赖 metrics-csv 非空**：若将 `--metrics-csv ""` 禁用日志，同时设置 `--prediction-metrics-path auto`，将无法派生输出路径（等价禁用）。
 - **pinn/fnn CSV 列不完全一致**：pinn 会额外写 `bc_loss_total`（因为 residual + bc 两类损失），fnn 仅监督损失；做跨模式聚合时需对齐列名或只取 `loss_train_total`/预测指标。

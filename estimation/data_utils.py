@@ -146,6 +146,22 @@ def apply_quantile_clipping(
     return df, stats
 
 
+def apply_quantile_bounds(
+    df: pd.DataFrame,
+    stats: Dict[str, Tuple[float, float]] | None,
+) -> pd.DataFrame:
+    """Apply pre-computed quantile bounds to a dataframe."""
+    if not stats:
+        return df
+    available = [col for col in stats if col in df.columns]
+    if not available:
+        return df
+    lower = {col: stats[col][0] for col in available}
+    upper = {col: stats[col][1] for col in available}
+    df.loc[:, available] = df[available].clip(lower=lower, upper=upper, axis=1)
+    return df
+
+
 def _expand_cache_path(path: str | None) -> str | None:
     if not path:
         return None
@@ -227,4 +243,3 @@ __all__ = [
     "_load_normalizer_cache",
     "_save_normalizer_cache",
 ]
-
